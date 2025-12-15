@@ -2,8 +2,10 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"cloud.google.com/go/compute/metadata"
@@ -12,6 +14,7 @@ import (
 )
 
 type Config struct {
+	DryRun        bool                `mapstructure:"dry_run"`
 	SYNQ          SYNQConfig          `mapstructure:"synq"`
 	GCP           GCPConfig           `mapstructure:"gcp"`
 	Types         TypesConfig         `mapstructure:"types"`
@@ -35,8 +38,8 @@ type GCPConfig struct {
 type TypesConfig struct {
 	TopicTypeID        int32  `mapstructure:"topic_type_id"`
 	SubscriptionTypeID int32  `mapstructure:"subscription_type_id"`
-	TopicIcon          string `mapstructure:"topic_icon"`          // Optional path to custom topic icon SVG
-	SubscriptionIcon   string `mapstructure:"subscription_icon"`   // Optional path to custom subscription icon SVG
+	TopicIcon          string `mapstructure:"topic_icon"`        // Optional path to custom topic icon SVG
+	SubscriptionIcon   string `mapstructure:"subscription_icon"` // Optional path to custom subscription icon SVG
 }
 
 type FilterConfig struct {
@@ -71,6 +74,11 @@ func detectProjectID(ctx context.Context) string {
 		return projectID
 	}
 
+	// Try gcloud CLI configuration
+	if projectID := getGcloudProjectID(ctx); projectID != "" {
+		return projectID
+	}
+
 	// Try GCP metadata server (when running on GCP)
 	if metadata.OnGCE() {
 		if projectID, err := metadata.ProjectID(); err == nil && projectID != "" {
@@ -81,10 +89,28 @@ func detectProjectID(ctx context.Context) string {
 	return ""
 }
 
+// getGcloudProjectID attempts to read the project ID from gcloud CLI configuration
+func getGcloudProjectID(ctx context.Context) string {
+	cmd := exec.CommandContext(ctx, "gcloud", "config", "get-value", "project")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	projectID := strings.TrimSpace(string(output))
+	// gcloud returns "(unset)" if no project is configured
+	if projectID == "" || projectID == "(unset)" {
+		return ""
+	}
+	return projectID
+}
+
 // InitFlags initializes all configuration flags
 func InitFlags() {
 	// Config file flag
 	pflag.StringP("config", "c", "config.yaml", "Path to config file")
+
+	// General flags
+	pflag.Bool("dry-run", false, "Dry-run mode: scan GCP resources but don't call SYNQ API")
 
 	// SYNQ configuration
 	pflag.String("synq.client-id", "", "SYNQ API client ID (env: SYNQ_CLIENT_ID)")
@@ -107,7 +133,11 @@ func InitFlags() {
 	pflag.StringSlice("filter.topics.include", []string{}, "Topic name patterns to include (empty = all)")
 	pflag.StringSlice("filter.topics.exclude", []string{}, "Topic name patterns to exclude")
 	pflag.StringSlice("filter.subscriptions.include", []string{}, "Subscription name patterns to include (empty = all)")
-	pflag.StringSlice("filter.subscriptions.exclude", []string{"-[a-z0-9]{9,10}-[a-z0-9]{5}\\.subscription$"}, "Subscription name patterns to exclude")
+	pflag.StringSlice(
+		"filter.subscriptions.exclude",
+		[]string{"-[a-z0-9]{9,10}-[a-z0-9]{5}\\.subscription$"},
+		"Subscription name patterns to exclude",
+	)
 
 	// Relationship configuration
 	pflag.Bool("relationships.enabled", false, "Enable topic->subscription relationships")
@@ -134,8 +164,9 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	// Read config file (optional - don't error if it doesn't exist)
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			// Config file was found but another error was produced
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if !errors.As(err, &configFileNotFoundError) && !os.IsNotExist(err) {
+			// Config file was found but another error was produced (not a "not found" error)
 			return nil, fmt.Errorf("error reading config file: %w", err)
 		}
 		// Config file not found; ignore and continue
@@ -154,6 +185,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Bind flags
 	if err := v.BindPFlags(pflag.CommandLine); err != nil {
 		return nil, fmt.Errorf("error binding flags: %w", err)
+	}
+
+	// Manually bind dry-run flag (hyphen to underscore mapping)
+	if flag := pflag.CommandLine.Lookup("dry-run"); flag != nil {
+		v.BindPFlag("dry_run", flag)
 	}
 
 	// Unmarshal into config struct
@@ -182,6 +218,9 @@ func LoadConfig(configPath string) (*Config, error) {
 
 // setDefaults sets default values in viper
 func setDefaults(v *viper.Viper) {
+	// General defaults
+	v.SetDefault("dry_run", false)
+
 	// SYNQ defaults
 	v.SetDefault("synq.endpoint", "developer.synq.io:443")
 	v.SetDefault("synq.oauth_url", "https://developer.synq.io/oauth2/token")
@@ -202,14 +241,17 @@ func setDefaults(v *viper.Viper) {
 
 // validateConfig validates required configuration fields
 func validateConfig(cfg *Config) error {
-	if cfg.SYNQ.ClientID == "" {
-		return fmt.Errorf("SYNQ_CLIENT_ID is required (set via env var or --synq.client-id flag)")
-	}
-	if cfg.SYNQ.ClientSecret == "" {
-		return fmt.Errorf("SYNQ_CLIENT_SECRET is required (set via env var or --synq.client-secret flag)")
-	}
-	if cfg.SYNQ.Endpoint == "" {
-		return fmt.Errorf("synq.endpoint is required")
+	// Skip SYNQ credentials validation in dry-run mode
+	if !cfg.DryRun {
+		if cfg.SYNQ.ClientID == "" {
+			return fmt.Errorf("SYNQ_CLIENT_ID is required (set via env var or --synq.client-id flag)")
+		}
+		if cfg.SYNQ.ClientSecret == "" {
+			return fmt.Errorf("SYNQ_CLIENT_SECRET is required (set via env var or --synq.client-secret flag)")
+		}
+		if cfg.SYNQ.Endpoint == "" {
+			return fmt.Errorf("synq.endpoint is required")
+		}
 	}
 	if cfg.GCP.ProjectID == "" {
 		return fmt.Errorf(

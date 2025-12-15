@@ -115,15 +115,23 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Show dry-run mode warning
+	if cfg.DryRun {
+		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call SYNQ API")
+	}
+
 	// Setup clients
 	pubsubClient := mustCreatePubSubClient(ctx, cfg)
 	defer pubsubClient.Close()
 
-	synqClients := mustCreateSYNQClients(ctx, cfg)
-	defer synqClients.close()
+	var synqClients *synqClients
+	if !cfg.DryRun {
+		synqClients = mustCreateSYNQClients(ctx, cfg)
+		defer synqClients.close()
 
-	// Setup entity types in SYNQ
-	mustSetupEntityTypes(ctx, cfg, synqClients.types)
+		// Setup entity types in SYNQ
+		mustSetupEntityTypes(ctx, cfg, synqClients.types)
+	}
 
 	// Build filters from configuration
 	filters := buildFilters(cfg)
@@ -393,15 +401,20 @@ func validateSVG(data []byte) error {
 
 // syncResources syncs all Pub/Sub resources to SYNQ
 func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, clients *synqClients, filters *filters) syncStats {
+	var entitiesClient entitiescustomv1grpc.EntitiesServiceClient
+	if clients != nil {
+		entitiesClient = clients.entities
+	}
+
 	// Sync topics and subscriptions
-	createdEntities, acceptedTopics, topicCount := syncTopics(ctx, cfg, pubsubClient, clients.entities, filters.topics)
-	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, clients.entities, filters, acceptedTopics, &createdEntities)
+	createdEntities, acceptedTopics, topicCount := syncTopics(ctx, cfg, pubsubClient, entitiesClient, filters.topics)
+	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, entitiesClient, filters, acceptedTopics, &createdEntities)
 
-	// Manage relationships
-	manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
-
-	// Update entity group
-	updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
+	// Manage relationships and entity groups only if not in dry-run mode
+	if clients != nil {
+		manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
+		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
+	}
 
 	return syncStats{
 		Topics:        topicCount,
@@ -411,7 +424,13 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 }
 
 // syncTopics syncs all topics from Pub/Sub to SYNQ
-func syncTopics(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, entitiesClient entitiescustomv1grpc.EntitiesServiceClient, topicFilter Filter) ([]*entitiesv1.Identifier, map[string]bool, int) {
+func syncTopics(
+	ctx context.Context,
+	cfg *config.Config,
+	pubsubClient *pubsub.Client,
+	entitiesClient entitiescustomv1grpc.EntitiesServiceClient,
+	topicFilter Filter,
+) ([]*entitiesv1.Identifier, map[string]bool, int) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Scanning Pub/Sub topics")
 
@@ -462,7 +481,15 @@ func syncTopics(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Cl
 }
 
 // syncSubscriptions syncs all subscriptions from Pub/Sub to SYNQ
-func syncSubscriptions(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, entitiesClient entitiescustomv1grpc.EntitiesServiceClient, filters *filters, acceptedTopicIds map[string]bool, createdEntities *[]*entitiesv1.Identifier) (int, []*entitiescustomv1.Relationship) {
+func syncSubscriptions(
+	ctx context.Context,
+	cfg *config.Config,
+	pubsubClient *pubsub.Client,
+	entitiesClient entitiescustomv1grpc.EntitiesServiceClient,
+	filters *filters,
+	acceptedTopicIds map[string]bool,
+	createdEntities *[]*entitiesv1.Identifier,
+) (int, []*entitiescustomv1.Relationship) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Scanning Pub/Sub subscriptions")
 
@@ -547,6 +574,16 @@ func syncSubscriptions(ctx context.Context, cfg *config.Config, pubsubClient *pu
 func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesServiceClient, id *entitiesv1.Identifier, typeID int32, name string) {
 	logger := slog.Default()
 
+	// Skip SYNQ API call in dry-run mode
+	if client == nil {
+		logger.DebugContext(ctx, "[DRY-RUN] Would upsert entity",
+			slog.String("name", name),
+			slog.Int("type_id", int(typeID)),
+			slog.String("id", id.GetCustom().GetId()),
+		)
+		return
+	}
+
 	_, err := client.UpsertEntity(ctx, &entitiescustomv1.UpsertEntityRequest{
 		Entity: &entitiesv1.Entity{
 			Id:        id,
@@ -566,7 +603,12 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 // ============================================================================
 
 // manageRelationships creates and deletes relationships as needed
-func manageRelationships(ctx context.Context, client entitiescustomv1grpc.RelationshipsServiceClient, createdEntities []*entitiesv1.Identifier, relationshipsToCreate []*entitiescustomv1.Relationship) {
+func manageRelationships(
+	ctx context.Context,
+	client entitiescustomv1grpc.RelationshipsServiceClient,
+	createdEntities []*entitiesv1.Identifier,
+	relationshipsToCreate []*entitiescustomv1.Relationship,
+) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Retrieving existing relationships")
 
@@ -610,7 +652,10 @@ func manageRelationships(ctx context.Context, client entitiescustomv1grpc.Relati
 }
 
 // deduplicateRelationships filters out existing relationships and finds ones to delete
-func deduplicateRelationships(toCreate []*entitiescustomv1.Relationship, existing []*entitiescustomv1.Relationship) ([]*entitiescustomv1.Relationship, []*entitiescustomv1.Relationship) {
+func deduplicateRelationships(
+	toCreate []*entitiescustomv1.Relationship,
+	existing []*entitiescustomv1.Relationship,
+) ([]*entitiescustomv1.Relationship, []*entitiescustomv1.Relationship) {
 	toCreateMap := make(map[string]struct{})
 	existingMap := make(map[string]struct{})
 
@@ -654,7 +699,12 @@ func isPubSubRelationship(rel *entitiescustomv1.Relationship) bool {
 // ============================================================================
 
 // updateEntityGroup updates the entity group for automatic cleanup
-func updateEntityGroup(ctx context.Context, cfg *config.Config, client entitiescustomv1grpc.GroupsServiceClient, createdEntities []*entitiesv1.Identifier) {
+func updateEntityGroup(
+	ctx context.Context,
+	cfg *config.Config,
+	client entitiescustomv1grpc.GroupsServiceClient,
+	createdEntities []*entitiesv1.Identifier,
+) {
 	logger := slog.Default()
 
 	logger.InfoContext(ctx, "Updating entity group", slog.String("group_id", cfg.GCP.EntityGroupID))

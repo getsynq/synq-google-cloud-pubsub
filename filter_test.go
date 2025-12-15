@@ -1,8 +1,9 @@
 package main
 
 import (
-	"github.com/stretchr/testify/suite"
 	"testing"
+
+	"github.com/stretchr/testify/suite"
 )
 
 func TestFilterSuite(t *testing.T) {

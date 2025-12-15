@@ -66,13 +66,15 @@ GCP_PROJECT_ID=your-gcp-project-id
 
 See `.env.example` for a template.
 
-**Note:** The GCP project ID can be auto-detected from:
-- `GOOGLE_CLOUD_PROJECT` environment variable
-- `GCLOUD_PROJECT` environment variable (legacy)
-- GCP metadata server (when running on GCP)
-- `gcp.project_id` in config.yaml
+**Note:** The GCP project ID can be auto-detected from (in order of precedence):
+1. `GCP_PROJECT_ID` environment variable
+2. `GOOGLE_CLOUD_PROJECT` environment variable
+3. `GCLOUD_PROJECT` environment variable (legacy)
+4. `gcloud` CLI configuration (`gcloud config get-value project`)
+5. GCP metadata server (when running on GCP)
+6. `gcp.project_id` in config.yaml
 
-If not set via any of these methods, you must provide `GCP_PROJECT_ID`.
+If your gcloud CLI is configured with a project (`gcloud config set project YOUR_PROJECT`), the application will automatically use it.
 
 ### Optional: Configuration File (config.yaml)
 
@@ -212,6 +214,7 @@ All configuration options are available as command-line flags. Flags have the hi
 **Common flags:**
 - `-c, --config` - Path to config file (default: `config.yaml`)
 - `-h, --help` - Show help message
+- `--dry-run` - Dry-run mode: scan GCP resources but don't call SYNQ API
 - `--gcp.project-id` - GCP project ID (auto-detected if not set)
 - `--synq.client-id` - SYNQ API client ID (or use SYNQ_CLIENT_ID env var)
 - `--synq.client-secret` - SYNQ API client secret (or use SYNQ_CLIENT_SECRET env var)
@@ -240,6 +243,26 @@ All configuration options are available as command-line flags. Flags have the hi
 - `--synq.oauth-url` - SYNQ OAuth2 token URL (EU: `https://developer.synq.io/oauth2/token`, US: `https://api.us.synq.io/oauth2/token`)
 
 Run `go run main.go --help` to see all available flags.
+
+### Dry-Run Mode
+
+Use `--dry-run` to scan GCP Pub/Sub resources without making any changes to SYNQ:
+
+```bash
+# Dry-run mode (no SYNQ API calls)
+go run main.go --dry-run
+
+# Dry-run with debug logging to see what would be created
+LOG_LEVEL=DEBUG go run main.go --dry-run
+```
+
+In dry-run mode:
+- ✅ Scans GCP Pub/Sub topics and subscriptions
+- ✅ Applies filters
+- ✅ Shows what entities would be created
+- ❌ Does not call SYNQ API
+- ❌ Does not create/update entities or relationships
+- ❌ Does not require SYNQ credentials
 
 ### Examples
 

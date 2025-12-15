@@ -78,10 +78,10 @@ func TestLoadIcon(t *testing.T) {
 	validSVG := []byte(`<svg xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="40"/></svg>`)
 
 	tests := []struct {
-		name       string
-		customPath string
+		name        string
+		customPath  string
 		defaultIcon []byte
-		wantErr    bool
+		wantErr     bool
 	}{
 		{
 			name:        "use default icon when no custom path",
