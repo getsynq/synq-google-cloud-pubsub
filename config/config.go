@@ -1,0 +1,232 @@
+package config
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"cloud.google.com/go/compute/metadata"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+)
+
+type Config struct {
+	SYNQ          SYNQConfig          `mapstructure:"synq"`
+	GCP           GCPConfig           `mapstructure:"gcp"`
+	Types         TypesConfig         `mapstructure:"types"`
+	Filter        FilterConfig        `mapstructure:"filter"`
+	Relationships RelationshipsConfig `mapstructure:"relationships"`
+}
+
+type SYNQConfig struct {
+	ClientID     string `mapstructure:"client_id"`
+	ClientSecret string `mapstructure:"client_secret"`
+	Endpoint     string `mapstructure:"endpoint"`
+	OAuthURL     string `mapstructure:"oauth_url"`
+}
+
+type GCPConfig struct {
+	ProjectID     string `mapstructure:"project_id"`
+	UserAgent     string `mapstructure:"user_agent"`
+	EntityGroupID string `mapstructure:"entity_group_id"` // Entity group ID for tracking resources (defaults to pubsub::<project_id>)
+}
+
+type TypesConfig struct {
+	TopicTypeID        int32  `mapstructure:"topic_type_id"`
+	SubscriptionTypeID int32  `mapstructure:"subscription_type_id"`
+	TopicIcon          string `mapstructure:"topic_icon"`          // Optional path to custom topic icon SVG
+	SubscriptionIcon   string `mapstructure:"subscription_icon"`   // Optional path to custom subscription icon SVG
+}
+
+type FilterConfig struct {
+	Topics        FilterRules `mapstructure:"topics"`
+	Subscriptions FilterRules `mapstructure:"subscriptions"`
+}
+
+type FilterRules struct {
+	Include []string `mapstructure:"include"`
+	Exclude []string `mapstructure:"exclude"`
+}
+
+type RelationshipsConfig struct {
+	Enabled bool        `mapstructure:"enabled"` // Whether to create relationships at all
+	Filter  FilterRules `mapstructure:"filter"`  // Include/exclude patterns for relationship pairs
+}
+
+// detectProjectID attempts to auto-detect the GCP project ID from the environment
+func detectProjectID(ctx context.Context) string {
+	// Try GCP_PROJECT_ID environment variable first
+	if projectID := os.Getenv("GCP_PROJECT_ID"); projectID != "" {
+		return projectID
+	}
+
+	// Try GOOGLE_CLOUD_PROJECT (standard GCP env var)
+	if projectID := os.Getenv("GOOGLE_CLOUD_PROJECT"); projectID != "" {
+		return projectID
+	}
+
+	// Try GCLOUD_PROJECT (legacy)
+	if projectID := os.Getenv("GCLOUD_PROJECT"); projectID != "" {
+		return projectID
+	}
+
+	// Try GCP metadata server (when running on GCP)
+	if metadata.OnGCE() {
+		if projectID, err := metadata.ProjectID(); err == nil && projectID != "" {
+			return projectID
+		}
+	}
+
+	return ""
+}
+
+// InitFlags initializes all configuration flags
+func InitFlags() {
+	// Config file flag
+	pflag.StringP("config", "c", "config.yaml", "Path to config file")
+
+	// SYNQ configuration
+	pflag.String("synq.client-id", "", "SYNQ API client ID (env: SYNQ_CLIENT_ID)")
+	pflag.String("synq.client-secret", "", "SYNQ API client secret (env: SYNQ_CLIENT_SECRET)")
+	pflag.String("synq.endpoint", "developer.synq.io:443", "SYNQ API endpoint")
+	pflag.String("synq.oauth-url", "https://developer.synq.io/oauth2/token", "SYNQ OAuth2 token URL")
+
+	// GCP configuration
+	pflag.String("gcp.project-id", "", "GCP project ID (auto-detected if not set)")
+	pflag.String("gcp.user-agent", "synq-pubsub-client-v1.0.0", "User agent for GCP API calls")
+	pflag.String("gcp.entity-group-id", "", "Entity group ID (defaults to pubsub::<project_id>)")
+
+	// Entity type configuration
+	pflag.Int32("types.topic-type-id", 20, "SYNQ entity type ID for topics")
+	pflag.Int32("types.subscription-type-id", 21, "SYNQ entity type ID for subscriptions")
+	pflag.String("types.topic-icon", "", "Path to custom topic icon SVG")
+	pflag.String("types.subscription-icon", "", "Path to custom subscription icon SVG")
+
+	// Filter configuration
+	pflag.StringSlice("filter.topics.include", []string{}, "Topic name patterns to include (empty = all)")
+	pflag.StringSlice("filter.topics.exclude", []string{}, "Topic name patterns to exclude")
+	pflag.StringSlice("filter.subscriptions.include", []string{}, "Subscription name patterns to include (empty = all)")
+	pflag.StringSlice("filter.subscriptions.exclude", []string{"-[a-z0-9]{9,10}-[a-z0-9]{5}\\.subscription$"}, "Subscription name patterns to exclude")
+
+	// Relationship configuration
+	pflag.Bool("relationships.enabled", false, "Enable topic->subscription relationships")
+	pflag.StringSlice("relationships.filter.include", []string{}, "Relationship patterns to include (format: topic->subscription)")
+	pflag.StringSlice("relationships.filter.exclude", []string{}, "Relationship patterns to exclude")
+}
+
+// LoadConfig loads configuration from file, environment variables, and flags
+// Configuration precedence: defaults → config file → environment variables → flags
+func LoadConfig(configPath string) (*Config, error) {
+	v := viper.New()
+
+	// Set config file
+	if configPath != "" {
+		v.SetConfigFile(configPath)
+	} else {
+		v.SetConfigName("config")
+		v.SetConfigType("yaml")
+		v.AddConfigPath(".")
+	}
+
+	// Set defaults
+	setDefaults(v)
+
+	// Read config file (optional - don't error if it doesn't exist)
+	if err := v.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			// Config file was found but another error was produced
+			return nil, fmt.Errorf("error reading config file: %w", err)
+		}
+		// Config file not found; ignore and continue
+	}
+
+	// Bind environment variables
+	v.SetEnvPrefix("") // No prefix, use exact names
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AutomaticEnv()
+
+	// Manually bind specific env vars for backward compatibility
+	v.BindEnv("synq.client_id", "SYNQ_CLIENT_ID")
+	v.BindEnv("synq.client_secret", "SYNQ_CLIENT_SECRET")
+	v.BindEnv("gcp.project_id", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT")
+
+	// Bind flags
+	if err := v.BindPFlags(pflag.CommandLine); err != nil {
+		return nil, fmt.Errorf("error binding flags: %w", err)
+	}
+
+	// Unmarshal into config struct
+	cfg := &Config{}
+	if err := v.Unmarshal(cfg); err != nil {
+		return nil, fmt.Errorf("error unmarshaling config: %w", err)
+	}
+
+	// Auto-detect project ID if not set
+	if cfg.GCP.ProjectID == "" {
+		cfg.GCP.ProjectID = detectProjectID(context.Background())
+	}
+
+	// Set default entity group ID if not configured
+	if cfg.GCP.EntityGroupID == "" && cfg.GCP.ProjectID != "" {
+		cfg.GCP.EntityGroupID = fmt.Sprintf("pubsub::%s", cfg.GCP.ProjectID)
+	}
+
+	// Validate required fields
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+// setDefaults sets default values in viper
+func setDefaults(v *viper.Viper) {
+	// SYNQ defaults
+	v.SetDefault("synq.endpoint", "developer.synq.io:443")
+	v.SetDefault("synq.oauth_url", "https://developer.synq.io/oauth2/token")
+
+	// GCP defaults
+	v.SetDefault("gcp.user_agent", "synq-pubsub-client-v1.0.0")
+
+	// Entity type defaults
+	v.SetDefault("types.topic_type_id", 20)
+	v.SetDefault("types.subscription_type_id", 21)
+
+	// Relationships disabled by default
+	v.SetDefault("relationships.enabled", false)
+
+	// Default subscription filters
+	v.SetDefault("filter.subscriptions.exclude", []string{"-[a-z0-9]{9,10}-[a-z0-9]{5}\\.subscription$"})
+}
+
+// validateConfig validates required configuration fields
+func validateConfig(cfg *Config) error {
+	if cfg.SYNQ.ClientID == "" {
+		return fmt.Errorf("SYNQ_CLIENT_ID is required (set via env var or --synq.client-id flag)")
+	}
+	if cfg.SYNQ.ClientSecret == "" {
+		return fmt.Errorf("SYNQ_CLIENT_SECRET is required (set via env var or --synq.client-secret flag)")
+	}
+	if cfg.SYNQ.Endpoint == "" {
+		return fmt.Errorf("synq.endpoint is required")
+	}
+	if cfg.GCP.ProjectID == "" {
+		return fmt.Errorf(
+			"GCP project ID is required. Set via:\n" +
+				"  - GCP_PROJECT_ID environment variable\n" +
+				"  - GOOGLE_CLOUD_PROJECT environment variable\n" +
+				"  - --gcp.project-id flag\n" +
+				"  - gcp.project_id in config.yaml\n" +
+				"  - or run on GCP (auto-detected from metadata server)",
+		)
+	}
+	if cfg.Types.TopicTypeID == 0 {
+		return fmt.Errorf("types.topic_type_id is required")
+	}
+	if cfg.Types.SubscriptionTypeID == 0 {
+		return fmt.Errorf("types.subscription_type_id is required")
+	}
+
+	return nil
+}
