@@ -81,7 +81,7 @@ func detectProjectID(ctx context.Context) string {
 
 	// Try GCP metadata server (when running on GCP)
 	if metadata.OnGCE() {
-		if projectID, err := metadata.ProjectID(); err == nil && projectID != "" {
+		if projectID, err := metadata.ProjectIDWithContext(ctx); err == nil && projectID != "" {
 			return projectID
 		}
 	}
@@ -178,9 +178,9 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.AutomaticEnv()
 
 	// Manually bind specific env vars for backward compatibility
-	v.BindEnv("synq.client_id", "SYNQ_CLIENT_ID")
-	v.BindEnv("synq.client_secret", "SYNQ_CLIENT_SECRET")
-	v.BindEnv("gcp.project_id", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT")
+	_ = v.BindEnv("synq.client_id", "SYNQ_CLIENT_ID")
+	_ = v.BindEnv("synq.client_secret", "SYNQ_CLIENT_SECRET")
+	_ = v.BindEnv("gcp.project_id", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT")
 
 	// Bind flags
 	if err := v.BindPFlags(pflag.CommandLine); err != nil {
@@ -189,7 +189,7 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	// Manually bind dry-run flag (hyphen to underscore mapping)
 	if flag := pflag.CommandLine.Lookup("dry-run"); flag != nil {
-		v.BindPFlag("dry_run", flag)
+		_ = v.BindPFlag("dry_run", flag)
 	}
 
 	// Unmarshal into config struct

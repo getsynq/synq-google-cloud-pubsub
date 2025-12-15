@@ -15,7 +15,7 @@ import (
 	entitiescustomv1grpc "buf.build/gen/go/getsynq/api/grpc/go/synq/entities/custom/v1/customv1grpc"
 	entitiescustomv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/custom/v1"
 	entitiesv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/v1"
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub" //nolint:staticcheck // TODO: Migrate to pubsub/v2 - requires API changes
 	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
@@ -122,12 +122,20 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Setup clients
 	pubsubClient := mustCreatePubSubClient(ctx, cfg)
-	defer pubsubClient.Close()
+	defer func() {
+		if err := pubsubClient.Close(); err != nil {
+			logger.ErrorContext(ctx, "Error closing Pub/Sub client", slog.String("error", err.Error()))
+		}
+	}()
 
 	var synqClients *synqClients
 	if !cfg.DryRun {
 		synqClients = mustCreateSYNQClients(ctx, cfg)
-		defer synqClients.close()
+		defer func() {
+			if err := synqClients.close(); err != nil {
+				logger.ErrorContext(ctx, "Error closing SYNQ clients", slog.String("error", err.Error()))
+			}
+		}()
 
 		// Setup entity types in SYNQ
 		mustSetupEntityTypes(ctx, cfg, synqClients.types)
@@ -264,7 +272,7 @@ func mustCreateSYNQClients(ctx context.Context, cfg *config.Config) *synqClients
 		grpc.WithAuthority(host),
 	}
 
-	conn, err := grpc.DialContext(ctx, cfg.SYNQ.Endpoint, opts...)
+	conn, err := grpc.NewClient(cfg.SYNQ.Endpoint, opts...)
 	if err != nil {
 		logger.ErrorContext(ctx, "Failed to connect to SYNQ API", slog.String("error", err.Error()))
 		os.Exit(1)
