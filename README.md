@@ -8,6 +8,7 @@ This integration:
 - Discovers all Pub/Sub topics and subscriptions in your GCP project
 - Creates and maintains entities in SYNQ for visibility and governance
 - Tracks relationships between topics and subscriptions
+- Creates cross-platform lineage to BigQuery tables and Cloud Storage buckets
 - Automatically cleans up removed resources
 - Supports flexible filtering and customization
 
@@ -136,6 +137,38 @@ relationships:
     # Examples:
     # include: ["important-topic->.*"]  # Only create relationships for important-topic
     # exclude: ["test-.*->.*"]          # Skip relationships for test topics
+```
+
+### Cross-Platform Lineage
+
+The integration automatically creates lineage relationships when subscriptions deliver messages to:
+- **BigQuery tables** (via `BigQueryConfig`) - creates relationships to native BigQuery table entities
+- **Cloud Storage buckets** (via `CloudStorageConfig`) - creates relationships to custom GCS bucket entities
+
+**Requirements:**
+- **BigQuery lineage**: Native BigQuery integration in SYNQ. Links to non-existent tables are created anyway (safe).
+- **Cloud Storage lineage**: [GCS integration](https://github.com/getsynq/synq-google-cloud-storage) should be set up first. Links to non-existent `gcs::<bucket_name>` entities are skipped with debug logging.
+
+**Behavior:**
+- **BigQuery relationships**: Always created (non-custom entities are safe to link)
+- **GCS relationships**: Only created if the `gcs::<bucket_name>` entity exists in SYNQ
+  - If GCS bucket entity doesn't exist, relationship is skipped with a debug log message
+  - No sync failures - relationships are created opportunistically
+
+**Optional - Excluding Cloud Storage relationships:**
+
+While not required (missing entities are safely skipped), you can explicitly exclude GCS relationships if desired:
+
+```yaml
+relationships:
+  enabled: true
+  filter:
+    exclude:
+      # Optional: Explicitly exclude GCS relationships
+      - '->gcs-.*'
+
+      # Optional: Exclude BigQuery relationships
+      # - '->bq-.*'
 ```
 
 **Defaults:**

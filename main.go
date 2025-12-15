@@ -416,7 +416,19 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 
 	// Sync topics and subscriptions
 	createdEntities, acceptedTopics, topicCount := syncTopics(ctx, cfg, pubsubClient, entitiesClient, filters.topics)
-	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, entitiesClient, filters, acceptedTopics, &createdEntities)
+
+	// List existing custom entities for relationship validation (only if relationships are enabled)
+	var customEntities map[string]bool
+	if cfg.Relationships.Enabled && entitiesClient != nil {
+		var err error
+		customEntities, err = listCustomEntities(ctx, entitiesClient)
+		if err != nil {
+			slog.Default().WarnContext(ctx, "Failed to list custom entities", slog.String("error", err.Error()))
+			customEntities = make(map[string]bool) // Use empty map on error
+		}
+	}
+
+	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, entitiesClient, filters, acceptedTopics, &createdEntities, customEntities)
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
@@ -497,6 +509,7 @@ func syncSubscriptions(
 	filters *filters,
 	acceptedTopicIds map[string]bool,
 	createdEntities *[]*entitiesv1.Identifier,
+	customEntities map[string]bool,
 ) (int, []*entitiescustomv1.Relationship) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Scanning Pub/Sub subscriptions")
@@ -560,6 +573,7 @@ func syncSubscriptions(
 
 		// Create relationship if enabled and passes filter
 		if cfg.Relationships.Enabled {
+			// Topic -> Subscription relationship
 			relationshipKey := fmt.Sprintf("%s->%s", subscription.Topic.ID(), subscription.ID())
 			if filters.relationships.Accept(relationshipKey) {
 				relationshipsToCreate = append(relationshipsToCreate, &entitiescustomv1.Relationship{
@@ -570,6 +584,71 @@ func syncSubscriptions(
 					slog.String("topic", subscription.Topic.ID()),
 					slog.String("subscription", subscription.ID()),
 				)
+			}
+
+			// BigQuery delivery: Subscription -> BigQuery Table relationship
+			// BigQuery entities are not custom entities and are safe to link
+			if subscription.BigQueryConfig.Table != "" {
+				// Parse BigQuery table reference (format: projectId.datasetId.tableId or projectId:datasetId.tableId)
+				tableParts := strings.ReplaceAll(subscription.BigQueryConfig.Table, ":", ".")
+				parts := strings.Split(tableParts, ".")
+				if len(parts) == 3 {
+					bqTableID := &entitiesv1.Identifier{
+						Id: &entitiesv1.Identifier_BigqueryTable{
+							BigqueryTable: &entitiesv1.BigqueryTableIdentifier{
+								Project: parts[0],
+								Dataset: parts[1],
+								Table:   parts[2],
+							},
+						},
+					}
+
+					relationshipKey := fmt.Sprintf("%s->bq-%s", subscription.ID(), subscription.BigQueryConfig.Table)
+					if filters.relationships.Accept(relationshipKey) {
+						relationshipsToCreate = append(relationshipsToCreate, &entitiescustomv1.Relationship{
+							Upstream:   subscriptionID,
+							Downstream: bqTableID,
+						})
+						logger.DebugContext(ctx, "Queued BigQuery relationship",
+							slog.String("subscription", subscription.ID()),
+							slog.String("bigquery_table", subscription.BigQueryConfig.Table),
+						)
+					}
+				}
+			}
+
+			// Cloud Storage delivery: Subscription -> GCS Bucket relationship
+			// Check if GCS bucket entity exists (GCS entities are custom entities)
+			if subscription.CloudStorageConfig.Bucket != "" {
+				gcsCustomID := fmt.Sprintf("gcs::%s", subscription.CloudStorageConfig.Bucket)
+
+				// Check if GCS bucket entity exists in the custom entities map
+				if customEntities == nil || customEntities[gcsCustomID] {
+					gcsID := &entitiesv1.Identifier{
+						Id: &entitiesv1.Identifier_Custom{
+							Custom: &entitiesv1.CustomIdentifier{
+								Id: gcsCustomID,
+							},
+						},
+					}
+
+					relationshipKey := fmt.Sprintf("%s->gcs-%s", subscription.ID(), subscription.CloudStorageConfig.Bucket)
+					if filters.relationships.Accept(relationshipKey) {
+						relationshipsToCreate = append(relationshipsToCreate, &entitiescustomv1.Relationship{
+							Upstream:   subscriptionID,
+							Downstream: gcsID,
+						})
+						logger.DebugContext(ctx, "Queued GCS relationship",
+							slog.String("subscription", subscription.ID()),
+							slog.String("gcs_bucket", subscription.CloudStorageConfig.Bucket),
+						)
+					}
+				} else {
+					logger.DebugContext(ctx, "Skipping GCS relationship - bucket entity not found",
+						slog.String("subscription", subscription.ID()),
+						slog.String("gcs_bucket", subscription.CloudStorageConfig.Bucket),
+					)
+				}
 			}
 		}
 	}
@@ -802,4 +881,25 @@ func truncate(s string, maxLen int) string {
 		return string(runes[:maxLen])
 	}
 	return s
+}
+
+// listCustomEntities retrieves all custom entities and returns them as a map for efficient lookups
+func listCustomEntities(ctx context.Context, client entitiescustomv1grpc.EntitiesServiceClient) (map[string]bool, error) {
+	if client == nil {
+		return nil, nil // In dry-run mode, return nil
+	}
+
+	resp, err := client.ListEntities(ctx, &entitiescustomv1.ListEntitiesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list entities: %w", err)
+	}
+
+	entityMap := make(map[string]bool)
+	for _, entity := range resp.GetEntities() {
+		if customID := entity.GetId().GetCustom(); customID != nil {
+			entityMap[customID.GetId()] = true
+		}
+	}
+
+	return entityMap, nil
 }

@@ -115,3 +115,30 @@ func (s *FilterSuite) TestFilter() {
 - Icons validated as valid SVG XML before use
 - Version info injected via ldflags: `version`, `commit`, `date`
 - Context cancellation propagates to all operations for graceful shutdown
+
+### Cross-Platform Lineage
+
+The integration creates relationships to external platforms when subscriptions have delivery configured:
+
+**BigQuery Lineage:**
+- Triggered when `subscription.BigQueryConfig.Table` is set
+- Creates relationship to BigQuery table using `BigqueryTableIdentifier`
+- Table format: `project:dataset.table` or `project.dataset.table`
+- Requires native BigQuery integration in SYNQ
+- **Behavior**: Links to non-existent tables are **silently ignored** by SYNQ
+
+**Cloud Storage Lineage:**
+- Triggered when `subscription.CloudStorageConfig.Bucket` is set
+- Creates relationship using custom identifier: `gcs::<bucket_name>`
+- Requires GCS integration (https://github.com/getsynq/synq-google-cloud-storage)
+- **Behavior**: Links to non-existent `gcs::*` entities **WILL FAIL** the sync operation
+
+**IMPORTANT - Excluding Cloud Storage relationships:**
+If GCS integration isn't set up, you MUST exclude GCS relationships to prevent sync failures:
+```yaml
+relationships:
+  filter:
+    exclude:
+      - '->gcs-.*'  # REQUIRED if Cloud Storage integration not configured
+      - '->bq-.*'   # Optional (BigQuery links are silently ignored)
+```

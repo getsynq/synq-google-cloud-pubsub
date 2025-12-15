@@ -41,3 +41,12 @@ relationships:
     # Examples:
     # include: ["important-topic->.*"]  # Only create relationships for important-topic
     # exclude: ["test-.*->.*"]          # Skip relationships for test topics
+
+    # Cross-platform lineage: Automatically creates relationships to BigQuery and GCS
+    # - BigQuery links are silently ignored if tables don't exist
+    # - GCS links WILL FAIL if gcs::<bucket> entities don't exist
+    #
+    # IMPORTANT: If GCS integration not set up, exclude GCS relationships to prevent sync failures:
+    # exclude:
+    #   - '->gcs-.*'  # REQUIRED if Cloud Storage integration not configured
+    #   - '->bq-.*'   # Optional: Exclude BigQuery relationships
