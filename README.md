@@ -1,6 +1,17 @@
-# integration-google-cloud-pubsub
+# SYNQ Google Cloud Pub/Sub Integration
 
-Integration which scrapes Google Cloud Pub/Sub topics and subscriptions as custom entities in the SYNQ platform.
+Automatically import and track your Google Cloud Pub/Sub topics and subscriptions in the SYNQ data catalog platform.
+
+## What It Does
+
+This integration:
+- Discovers all Pub/Sub topics and subscriptions in your GCP project
+- Creates and maintains entities in SYNQ for visibility and governance
+- Tracks relationships between topics and subscriptions
+- Automatically cleans up removed resources
+- Supports flexible filtering and customization
+
+**Use cases:** Data catalog management, resource discovery, compliance tracking, cross-platform data lineage.
 
 ## Installation
 
