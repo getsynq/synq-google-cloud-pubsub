@@ -311,6 +311,7 @@ All configuration options are available as command-line flags. Flags have the hi
 
 **Relationship flags:**
 - `--relationships.enabled` - Enable topic->subscription relationships (default: false)
+- `--relationships.prune` - Withdraw the topic->subscription relationships this integration published, and create none
 - `--relationships.filter.include` - Relationship patterns to include
 - `--relationships.filter.exclude` - Relationship patterns to exclude
 
@@ -403,6 +404,13 @@ The integration consists of three main components:
 **Entity Groups:** The integration uses entity groups to track all entities created in each run. When the group is updated, Coalesce Quality automatically removes entities that were in the previous group but not in the current one, enabling automatic cleanup of deleted resources.
 
 **Relationship Management:** When enabled, the integration creates relationships between topics and their subscriptions, and withdraws the ones that no longer exist.
+
+**Relationships are off by default on purpose.** Linking a topic to its
+subscriptions closes a cycle for every service that consumes a topic it also
+publishes, and a catalog full of two-hop cycles is harder to follow than one
+where the publishing and consuming sides are separate. `--relationships.prune`
+is the way back if a workspace turned them on: it withdraws the edges this
+integration published and creates none.
 
 A run only ever withdraws relationships **it computed itself**:
 

@@ -107,6 +107,11 @@ type FilterRules struct {
 type RelationshipsConfig struct {
 	Enabled bool        `mapstructure:"enabled"` // Whether to create relationships at all
 	Filter  FilterRules `mapstructure:"filter"`  // Include/exclude patterns for relationship pairs
+	// Prune withdraws the topic-to-subscription edges this integration
+	// published and creates none. It is how a workspace that turned
+	// relationships on gets back to a graph where a topic and its subscriptions
+	// are separate, which is what the default has always been.
+	Prune bool `mapstructure:"prune"`
 }
 
 // detectProjectID attempts to auto-detect the GCP project ID from the environment
@@ -205,6 +210,7 @@ func InitFlags() {
 
 	// Relationship configuration
 	pflag.Bool("relationships.enabled", false, "Enable topic->subscription relationships")
+	pflag.Bool("relationships.prune", false, "Withdraw the topic->subscription relationships this integration published, and create none")
 	pflag.StringSlice("relationships.filter.include", []string{}, "Relationship patterns to include (format: topic->subscription)")
 	pflag.StringSlice("relationships.filter.exclude", []string{}, "Relationship patterns to exclude")
 }

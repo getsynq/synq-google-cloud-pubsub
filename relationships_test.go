@@ -108,3 +108,23 @@ func TestAFilteredSubscriptionKeepsItsEdge(t *testing.T) {
 
 	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.live.subscription"}, edgeKeys(kept))
 }
+
+// TestPruneWithdrawsOnlyWhatThisToolPublished covers the way back out. Turning
+// relationships on was a deliberate act and so is undoing it, so prune is allowed
+// to delete where a plain run with nothing to create is not — but it is still
+// held to the same shape and inventory rules.
+func TestPruneWithdrawsOnlyWhatThisToolPublished(t *testing.T) {
+	existing := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+		edge("pubsub::topic", "pubsub::topic::topic.other.subscription"),
+		edge("pubsub::topic", "service::consumer"),
+		edge("gcs::artefacts", "pubsub::topic"),
+	}
+
+	owned := ownedRelationships(existing)
+
+	assert.Equal(t, []string{
+		"pubsub::topic->pubsub::topic::topic.live.subscription",
+		"pubsub::topic->pubsub::topic::topic.other.subscription",
+	}, edgeKeys(owned))
+}

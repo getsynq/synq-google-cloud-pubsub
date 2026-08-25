@@ -61,7 +61,8 @@ default, and an empty desired set used to mean "delete every stored
 topic-to-subscription edge", which wiped another integration's lineage from a
 live workspace.
 
-- `manageRelationships` is only called when `relationships.enabled`.
+- `manageRelationships` is only called when `relationships.enabled` or
+  `relationships.prune`.
 - A run that computed no relationships withdraws none.
 - `ownsRelationship` is the shape test: a subscription's id is its topic's id plus
   the subscription name, so an edge to anything else touching that topic belongs
@@ -71,6 +72,13 @@ live workspace.
 
 `relationships_test.go` covers all four; the first test in it is the reproducer
 for the released bug.
+
+**Why the feature is off by default**, and why `--relationships.prune` exists:
+linking a topic to its subscriptions closes a cycle for every service that
+consumes a topic it also publishes, so the catalog becomes hard to follow. Prune
+is an explicit instruction to withdraw what this integration published, which is
+why it may delete where a plain run with an empty desired set may not — it is
+still held to `ownsRelationship` and `withinInventory`.
 
 ### Resource Filtering Implementation
 

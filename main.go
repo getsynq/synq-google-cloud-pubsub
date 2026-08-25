@@ -426,8 +426,8 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
-		if cfg.Relationships.Enabled {
-			manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
+		if cfg.Relationships.Enabled || cfg.Relationships.Prune {
+			manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate, cfg.Relationships.Prune)
 		}
 		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
 	}
@@ -686,11 +686,19 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 // ============================================================================
 
 // manageRelationships creates and deletes relationships as needed
+// manageRelationships reconciles the topic-to-subscription edges.
+//
+// prune inverts it: the run withdraws every edge it owns and creates none. That
+// is an explicit instruction rather than an empty desired set, which is why it
+// is allowed to delete where a plain run with nothing to create is not — the
+// operator asked for the graph to lose these edges, having decided the topic and
+// its subscriptions read better apart.
 func manageRelationships(
 	ctx context.Context,
 	client entitiescustomv1grpc.RelationshipsServiceClient,
 	createdEntities []*entitiesv1.Identifier,
 	relationshipsToCreate []*entitiescustomv1.Relationship,
+	prune bool,
 ) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Retrieving existing relationships")
@@ -703,11 +711,14 @@ func manageRelationships(
 		os.Exit(1)
 	}
 
-	// Deduplicate relationships
-	toCreate, toDelete := deduplicateRelationships(
-		relationshipsToCreate,
-		withinInventory(listResp.Relationships, createdEntities),
-	)
+	inventoried := withinInventory(listResp.Relationships, createdEntities)
+
+	var toCreate, toDelete []*entitiescustomv1.Relationship
+	if prune {
+		toDelete = ownedRelationships(inventoried)
+	} else {
+		toCreate, toDelete = deduplicateRelationships(relationshipsToCreate, inventoried)
+	}
 
 	logger.InfoContext(ctx, "Managing relationships",
 		slog.Int("to_create", len(toCreate)),
@@ -795,6 +806,17 @@ func ownsRelationship(rel *entitiescustomv1.Relationship) bool {
 		return false
 	}
 	return strings.HasPrefix(rel.Downstream.GetCustom().GetId(), topic+"::")
+}
+
+// ownedRelationships keeps the edges this integration is the producer of.
+func ownedRelationships(rels []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
+	var owned []*entitiescustomv1.Relationship
+	for _, rel := range rels {
+		if ownsRelationship(rel) {
+			owned = append(owned, rel)
+		}
+	}
+	return owned
 }
 
 // withinInventory keeps only the relationships whose both ends this run actually
