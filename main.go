@@ -432,7 +432,9 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
-		manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
+		if cfg.Relationships.Enabled {
+			manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
+		}
 		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
 	}
 
@@ -708,7 +710,10 @@ func manageRelationships(
 	}
 
 	// Deduplicate relationships
-	toCreate, toDelete := deduplicateRelationships(relationshipsToCreate, listResp.Relationships)
+	toCreate, toDelete := deduplicateRelationships(
+		relationshipsToCreate,
+		withinInventory(listResp.Relationships, createdEntities),
+	)
 
 	logger.InfoContext(ctx, "Managing relationships",
 		slog.Int("to_create", len(toCreate)),
@@ -762,10 +767,17 @@ func deduplicateRelationships(
 		}
 	}
 
+	// A run that computed nothing withdraws nothing. Relationships are opt-in, so
+	// the desired set is empty on a plain run, and treating that as "everything
+	// stored is unwanted" is how this sync deleted another integration's edges.
+	if len(toCreate) == 0 {
+		return cleanedToCreate, nil
+	}
+
 	// Find relationships to delete (exist but shouldn't)
 	var toDelete []*entitiescustomv1.Relationship
 	for _, rel := range existing {
-		if isPubSubRelationship(rel) {
+		if ownsRelationship(rel) {
 			if _, exists := toCreateMap[rel.String()]; !exists {
 				toDelete = append(toDelete, rel)
 			}
@@ -775,10 +787,41 @@ func deduplicateRelationships(
 	return cleanedToCreate, toDelete
 }
 
-// isPubSubRelationship checks if a relationship is a Pub/Sub relationship
-func isPubSubRelationship(rel *entitiescustomv1.Relationship) bool {
-	return strings.HasPrefix(rel.Upstream.GetCustom().GetId(), "pubsub::") &&
-		strings.HasPrefix(rel.Downstream.GetCustom().GetId(), "pubsub::")
+// ownsRelationship reports whether this integration is the producer of rel: an
+// edge from a topic to one of its own subscriptions, which is the only shape it
+// publishes between two Pub/Sub entities.
+//
+// A subscription's entity id is its topic's id plus the subscription name, so
+// the test is exactly that. Everything else the workspace holds around a topic —
+// a service catalog linking a consumer, a bucket's notification edge — belongs to
+// another producer, and withdrawing it makes every run undo their work.
+func ownsRelationship(rel *entitiescustomv1.Relationship) bool {
+	topic := rel.Upstream.GetCustom().GetId()
+	if !strings.HasPrefix(topic, "pubsub::") {
+		return false
+	}
+	return strings.HasPrefix(rel.Downstream.GetCustom().GetId(), topic+"::")
+}
+
+// withinInventory keeps only the relationships whose both ends this run actually
+// inventoried. A subscription excluded by a filter is not this run's to judge, so
+// its edge is left where it is rather than read as drift.
+func withinInventory(
+	rels []*entitiescustomv1.Relationship,
+	inventoried []*entitiesv1.Identifier,
+) []*entitiescustomv1.Relationship {
+	seen := make(map[string]bool, len(inventoried))
+	for _, id := range inventoried {
+		seen[id.GetCustom().GetId()] = true
+	}
+
+	var kept []*entitiescustomv1.Relationship
+	for _, rel := range rels {
+		if seen[rel.Upstream.GetCustom().GetId()] && seen[rel.Downstream.GetCustom().GetId()] {
+			kept = append(kept, rel)
+		}
+	}
+	return kept
 }
 
 // ============================================================================

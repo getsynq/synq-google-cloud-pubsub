@@ -42,3 +42,69 @@ func TestNothingIsDeletedWhenTheRunComputedNothing(t *testing.T) {
 
 	assert.Empty(t, edgeKeys(toDelete), "a run that computed no relationships must not delete any")
 }
+
+// TestAStaleSubscriptionEdgeIsDeleted keeps the reconciliation this tool is for:
+// a subscription that is gone from Pub/Sub leaves an edge behind, and this run
+// inventoried both of its ends, so it is this tool's to withdraw.
+func TestAStaleSubscriptionEdgeIsDeleted(t *testing.T) {
+	desired := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+	}
+	existing := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+		edge("pubsub::topic", "pubsub::topic::topic.retired.subscription"),
+	}
+
+	toCreate, toDelete := deduplicateRelationships(desired, existing)
+
+	assert.Empty(t, toCreate, "an edge that already exists is not created again")
+	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.retired.subscription"}, edgeKeys(toDelete))
+}
+
+// TestAnotherProducersEdgeSurvives covers the entities this tool points at but
+// does not own. Listing the stored edges by topic also returns everything else
+// touching that topic, and deleting those makes this sync undo another
+// integration's lineage on every run.
+func TestAnotherProducersEdgeSurvives(t *testing.T) {
+	desired := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+	}
+	existing := []*entitiescustomv1.Relationship{
+		// A service catalog links its microservice entity to the topic.
+		edge("pubsub::topic", "service::consumer"),
+		// A bucket's notification edge, published by the Cloud Storage integration.
+		edge("gcs::artefacts", "pubsub::topic"),
+		// An edge between two Pub/Sub entities that is not a subscription of that topic.
+		edge("pubsub::topic", "pubsub::other::other.sub.subscription"),
+	}
+
+	_, toDelete := deduplicateRelationships(desired, existing)
+
+	assert.Empty(t, edgeKeys(toDelete))
+}
+
+// TestOnlySubscriptionsOfTheirOwnTopicAreOwned pins the shape test itself: a
+// subscription's id is its topic's id plus the subscription name.
+func TestOnlySubscriptionsOfTheirOwnTopicAreOwned(t *testing.T) {
+	assert.True(t, ownsRelationship(edge("pubsub::topic", "pubsub::topic::topic.sub.subscription")))
+	assert.False(t, ownsRelationship(edge("pubsub::topic", "pubsub::other::other.sub.subscription")))
+	assert.False(t, ownsRelationship(edge("pubsub::topic", "service::consumer")))
+	assert.False(t, ownsRelationship(edge("gcs::artefacts", "pubsub::topic")))
+}
+
+// TestAFilteredSubscriptionKeepsItsEdge is the other half of "only judge what
+// this run saw": a subscription excluded by configuration is never inventoried,
+// so its edge must not read as drift.
+func TestAFilteredSubscriptionKeepsItsEdge(t *testing.T) {
+	existing := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+		edge("pubsub::topic", "pubsub::topic::topic.excluded.subscription"),
+	}
+
+	kept := withinInventory(existing, []*entitiesv1.Identifier{
+		customID("pubsub::topic"),
+		customID("pubsub::topic::topic.live.subscription"),
+	})
+
+	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.live.subscription"}, edgeKeys(kept))
+}
