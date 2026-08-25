@@ -41,7 +41,7 @@ Understanding the sync flow when modifying code:
 - Context cancellation checked in iterator loops via `checkCancellation()`
 - GCP iterators use `iterator.Done` pattern for completion
 
-### SYNQ Custom Entities API Patterns
+### Custom Entities API Patterns
 
 **Custom Identifiers:**
 ```go
@@ -54,22 +54,23 @@ Understanding the sync flow when modifying code:
 }
 ```
 
-**Relationship Deduplication:**
-```go
-// Use relationship.String() as map key for deduplication
-existingMap := make(map[string]struct{})
-for _, rel := range existing {
-    existingMap[rel.String()] = struct{}{}
-}
+**Relationship reconciliation — a run only withdraws what it computed.** All
+four rules exist because breaking one is silent, and one of them was broken in a
+released version: relationships are opt-in, the desired set is therefore empty by
+default, and an empty desired set used to mean "delete every stored
+topic-to-subscription edge", which wiped another integration's lineage from a
+live workspace.
 
-// Filter out relationships that already exist
-var cleanedToCreate []*entitiescustomv1.Relationship
-for _, rel := range toCreate {
-    if _, exists := existingMap[rel.String()]; !exists {
-        cleanedToCreate = append(cleanedToCreate, rel)
-    }
-}
-```
+- `manageRelationships` is only called when `relationships.enabled`.
+- A run that computed no relationships withdraws none.
+- `ownsRelationship` is the shape test: a subscription's id is its topic's id plus
+  the subscription name, so an edge to anything else touching that topic belongs
+  to another producer.
+- `withinInventory` drops edges whose ends this run never saw, so a filtered
+  subscription keeps its lineage.
+
+`relationships_test.go` covers all four; the first test in it is the reproducer
+for the released bug.
 
 ### Resource Filtering Implementation
 
@@ -107,11 +108,29 @@ func (s *FilterSuite) TestFilter() {
 }
 ```
 
+### Authentication
+
+`auth.go` owns it. Credentials and the deployment come from
+`github.com/getsynq/quality-oauth-go`, the same library every Coalesce Quality
+CLI uses, so the credential store is shared and `--region` resolves identically
+everywhere.
+
+- Read environment variables through `qualityoauth.Getenv`, never `os.Getenv`, or
+  that one setting stops honouring its `SYNQ_`-prefixed alias.
+- Precedence is the library's, not this repo's: `Sources.Resolve` decides, and
+  `auth_test.go` pins the tiers so a local change cannot quietly diverge.
+- `App.FirstPartyClientID` stays empty. The authorization server seeds a client
+  row per released first-party CLI and this is not one; an id it does not know is
+  rejected at the authorize endpoint and the login then waits for a callback that
+  never arrives.
+- The `synq:` config section and the `--synq.*` flags are permanent aliases,
+  merged in `config.QualityConfig.merge` as the lower-precedence source.
+
 ## Key Implementation Details
 
 - Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`
 - Entity groups enable automatic cleanup via API's automatic deletion of entities not in new group
-- Relationships only managed for `pubsub::` prefixed entities (avoids touching other integrations)
+- Relationships are only withdrawn for topic-to-subscription edges this run inventoried (see above)
 - Icons validated as valid SVG XML before use
 - Version info injected via ldflags: `version`, `commit`, `date`
 - Context cancellation propagates to all operations for graceful shutdown
@@ -124,21 +143,21 @@ The integration creates relationships to external platforms when subscriptions h
 - Triggered when `subscription.BigQueryConfig.Table` is set
 - Creates relationship to BigQuery table using `BigqueryTableIdentifier`
 - Table format: `project:dataset.table` or `project.dataset.table`
-- Requires native BigQuery integration in SYNQ
-- **Behavior**: Links to non-existent tables are **silently ignored** by SYNQ
+- Requires a native BigQuery integration in Coalesce Quality
+- **Behavior**: Links to non-existent tables are **silently ignored**
 
 **Cloud Storage Lineage:**
 - Triggered when `subscription.CloudStorageConfig.Bucket` is set
 - Creates relationship using custom identifier: `gcs::<bucket_name>`
 - Requires GCS integration (https://github.com/getsynq/synq-google-cloud-storage)
-- **Behavior**: Links to non-existent `gcs::*` entities **WILL FAIL** the sync operation
+- **Behavior**: Links to absent `gcs::*` entities are skipped with a debug log
 
-**IMPORTANT - Excluding Cloud Storage relationships:**
-If GCS integration isn't set up, you MUST exclude GCS relationships to prevent sync failures:
+**Excluding Cloud Storage relationships** is optional — a link to an absent
+`gcs::*` entity is skipped with a debug log rather than failing the sync:
 ```yaml
 relationships:
   filter:
     exclude:
-      - '->gcs-.*'  # REQUIRED if Cloud Storage integration not configured
-      - '->bq-.*'   # Optional (BigQuery links are silently ignored)
+      - '->gcs-.*'
+      - '->bq-.*'
 ```

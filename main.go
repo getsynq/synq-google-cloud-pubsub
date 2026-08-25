@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	_ "embed"
 	"encoding/xml"
 	"fmt"
@@ -21,12 +20,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
-	"golang.org/x/oauth2/clientcredentials"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -45,17 +41,21 @@ var (
 // ============================================================================
 
 var rootCmd = &cobra.Command{
-	Use:   "synq-google-cloud-pubsub",
-	Short: "Sync Google Cloud Pub/Sub resources to SYNQ",
-	Long: `A Google Cloud Pub/Sub integration that syncs topics and subscriptions
-as custom entities in the SYNQ platform.
+	Use:   toolName,
+	Short: "Sync Google Cloud Pub/Sub resources to Coalesce Quality",
+	Long: `A Google Cloud Pub/Sub integration that publishes topics and subscriptions
+as custom entities in Coalesce Quality.
 
 The tool supports configuration through:
   - YAML config file (config.yaml by default)
-  - Environment variables (SYNQ_CLIENT_ID, etc.)
+  - Environment variables (QUALITY_CLIENT_ID, etc.)
   - Command-line flags (highest precedence)
 
-Configuration precedence: defaults → config file → environment variables → flags`,
+Configuration precedence: defaults → config file → environment variables → flags
+
+Authenticate with a browser login (` + toolName + ` auth login), client
+credentials in QUALITY_CLIENT_ID and QUALITY_CLIENT_SECRET, or a pre-issued
+QUALITY_TOKEN. A browser login is shared with the other Coalesce Quality tools.`,
 	Version: version,
 	RunE:    runSync,
 }
@@ -64,7 +64,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("synq-google-cloud-pubsub %s\n", version)
+		fmt.Printf("%s %s\n", toolName, version)
 		fmt.Printf("  commit: %s\n", commit)
 		fmt.Printf("  built:  %s\n", date)
 	},
@@ -78,7 +78,7 @@ func main() {
 	config.InitFlags()
 
 	// Add subcommands
-	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(versionCmd, authCmd)
 
 	// Execute the root command
 	if err := rootCmd.Execute(); err != nil {
@@ -115,9 +115,15 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if len(cfg.DeprecatedKeys) > 0 {
+		logger.WarnContext(ctx, "Configuration uses superseded keys; the quality section replaces them",
+			slog.Any("keys", cfg.DeprecatedKeys),
+		)
+	}
+
 	// Show dry-run mode warning
 	if cfg.DryRun {
-		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call SYNQ API")
+		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call the Coalesce Quality API")
 	}
 
 	// Setup clients
@@ -128,24 +134,24 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	var synqClients *synqClients
+	var qualityClients *qualityClients
 	if !cfg.DryRun {
-		synqClients = mustCreateSYNQClients(ctx, cfg)
+		qualityClients = mustCreateQualityClients(ctx, cfg)
 		defer func() {
-			if err := synqClients.close(); err != nil {
-				logger.ErrorContext(ctx, "Error closing SYNQ clients", slog.String("error", err.Error()))
+			if err := qualityClients.close(); err != nil {
+				logger.ErrorContext(ctx, "Error closing Coalesce Quality clients", slog.String("error", err.Error()))
 			}
 		}()
 
-		// Setup entity types in SYNQ
-		mustSetupEntityTypes(ctx, cfg, synqClients.types)
+		// Setup entity types in Coalesce Quality
+		mustSetupEntityTypes(ctx, cfg, qualityClients.types)
 	}
 
 	// Build filters from configuration
 	filters := buildFilters(cfg)
 
-	// Sync Pub/Sub resources to SYNQ
-	stats := syncResources(ctx, cfg, pubsubClient, synqClients, filters)
+	// Sync Pub/Sub resources to Coalesce Quality
+	stats := syncResources(ctx, cfg, pubsubClient, qualityClients, filters)
 
 	logger.InfoContext(ctx, "Sync completed successfully",
 		slog.Int("topics", stats.Topics),
@@ -160,8 +166,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 // Types
 // ============================================================================
 
-// synqClients holds all SYNQ API clients
-type synqClients struct {
+// qualityClients holds every Coalesce Quality API client a sync uses
+type qualityClients struct {
 	conn          *grpc.ClientConn
 	types         entitiescustomv1grpc.TypesServiceClient
 	entities      entitiescustomv1grpc.EntitiesServiceClient
@@ -169,7 +175,7 @@ type synqClients struct {
 	groups        entitiescustomv1grpc.GroupsServiceClient
 }
 
-func (c *synqClients) close() error {
+func (c *qualityClients) close() error {
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -249,38 +255,26 @@ func mustCreatePubSubClient(ctx context.Context, cfg *config.Config) *pubsub.Cli
 	return client
 }
 
-// mustCreateSYNQClients creates all SYNQ API clients or exits on error
-func mustCreateSYNQClients(ctx context.Context, cfg *config.Config) *synqClients {
+// mustCreateQualityClients resolves credentials and opens the API clients, or exits
+func mustCreateQualityClients(ctx context.Context, cfg *config.Config) *qualityClients {
 	logger := slog.Default()
-	logger.InfoContext(ctx, "Authenticating with SYNQ API", slog.String("endpoint", cfg.SYNQ.Endpoint))
 
-	host := strings.Split(cfg.SYNQ.Endpoint, ":")[0]
-
-	// Setup OAuth2
-	oauthConfig := &clientcredentials.Config{
-		ClientID:     cfg.SYNQ.ClientID,
-		ClientSecret: cfg.SYNQ.ClientSecret,
-		TokenURL:     cfg.SYNQ.OAuthURL,
-	}
-	oauthTokenSource := oauth.TokenSource{TokenSource: oauthConfig.TokenSource(ctx)}
-
-	// Setup gRPC connection
-	creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: false})
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
-		grpc.WithPerRPCCredentials(oauthTokenSource),
-		grpc.WithAuthority(host),
-	}
-
-	conn, err := grpc.NewClient(cfg.SYNQ.Endpoint, opts...)
+	target, err := resolveTarget(cfg)
 	if err != nil {
-		logger.ErrorContext(ctx, "Failed to connect to SYNQ API", slog.String("error", err.Error()))
+		logger.ErrorContext(ctx, "Could not resolve the Coalesce Quality deployment", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.InfoContext(ctx, "Authenticating with the Coalesce Quality API", slog.String("deployment", target.String()))
+
+	conn, err := connect(ctx, cfg, target)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to connect to the Coalesce Quality API", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	logger.InfoContext(ctx, "Successfully connected to SYNQ API")
+	logger.InfoContext(ctx, "Successfully connected to the Coalesce Quality API")
 
-	return &synqClients{
+	return &qualityClients{
 		conn:          conn,
 		types:         entitiescustomv1grpc.NewTypesServiceClient(conn),
 		entities:      entitiescustomv1grpc.NewEntitiesServiceClient(conn),
@@ -293,7 +287,7 @@ func mustCreateSYNQClients(ctx context.Context, cfg *config.Config) *synqClients
 // Entity Type Management
 // ============================================================================
 
-// mustSetupEntityTypes creates or updates entity types in SYNQ
+// mustSetupEntityTypes creates or updates the custom entity types
 func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient entitiescustomv1grpc.TypesServiceClient) {
 	logger := slog.Default()
 
@@ -308,7 +302,7 @@ func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient e
 	)
 
 	// Create/update entity types
-	logger.InfoContext(ctx, "Creating/updating entity types in SYNQ",
+	logger.InfoContext(ctx, "Creating/updating entity types in Coalesce Quality",
 		slog.Int("topic_type_id", int(cfg.Types.TopicTypeID)),
 		slog.Int("subscription_type_id", int(cfg.Types.SubscriptionTypeID)),
 	)
@@ -407,8 +401,8 @@ func validateSVG(data []byte) error {
 // Resource Sync
 // ============================================================================
 
-// syncResources syncs all Pub/Sub resources to SYNQ
-func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, clients *synqClients, filters *filters) syncStats {
+// syncResources publishes every Pub/Sub resource
+func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, clients *qualityClients, filters *filters) syncStats {
 	var entitiesClient entitiescustomv1grpc.EntitiesServiceClient
 	if clients != nil {
 		entitiesClient = clients.entities
@@ -445,7 +439,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 	}
 }
 
-// syncTopics syncs all topics from Pub/Sub to SYNQ
+// syncTopics publishes every topic
 func syncTopics(
 	ctx context.Context,
 	cfg *config.Config,
@@ -502,7 +496,7 @@ func syncTopics(
 	return createdEntities, acceptedTopicIds, topicCount
 }
 
-// syncSubscriptions syncs all subscriptions from Pub/Sub to SYNQ
+// syncSubscriptions publishes every subscription
 func syncSubscriptions(
 	ctx context.Context,
 	cfg *config.Config,
@@ -663,7 +657,7 @@ func syncSubscriptions(
 func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesServiceClient, id *entitiesv1.Identifier, typeID int32, name string) {
 	logger := slog.Default()
 
-	// Skip SYNQ API call in dry-run mode
+	// Skip the API call in dry-run mode
 	if client == nil {
 		logger.DebugContext(ctx, "[DRY-RUN] Would upsert entity",
 			slog.String("name", name),
