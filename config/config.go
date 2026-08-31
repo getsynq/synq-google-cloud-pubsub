@@ -63,8 +63,30 @@ type QualityConfig struct {
 	EndpointFlag string `mapstructure:"-"`
 }
 
+// hasCredential reports whether this section holds a credential that is usable
+// on its own: a pre-issued token, or both halves of a client pair. A lone client
+// id is not one, so its secret is still completed from the older section.
+func (q QualityConfig) hasCredential() bool {
+	return q.Token != "" || (q.ClientID != "" && q.ClientSecret != "")
+}
+
+// namesDeployment reports whether this section says which deployment to talk to.
+func (q QualityConfig) namesDeployment() bool {
+	return q.Endpoint != "" || q.Region != ""
+}
+
 // merge fills empty fields from a lower-precedence source, and reports which
 // deprecated keys were used so the caller can say so once.
+//
+// The credential and the deployment are taken whole, from one section or the
+// other, because their fields are alternatives rather than parts: a promoted
+// token beside a leftover legacy client pair leaves all three set, and connect
+// tries a client pair before a token, so field-wise merging let the section that
+// is meant to lose decide how the run authenticates. The same went for a
+// promoted region beside a legacy endpoint, which resolveTarget prefers.
+//
+// A section that names neither is still completed from the older one, which is
+// what keeps a credential split across the two sections working.
 func (q *QualityConfig) merge(older QualityConfig) []string {
 	var used []string
 	take := func(dst *string, src, name string) {
@@ -73,11 +95,17 @@ func (q *QualityConfig) merge(older QualityConfig) []string {
 			used = append(used, "synq."+name)
 		}
 	}
-	take(&q.ClientID, older.ClientID, "client_id")
-	take(&q.ClientSecret, older.ClientSecret, "client_secret")
-	take(&q.Token, older.Token, "token")
-	take(&q.Endpoint, older.Endpoint, "endpoint")
-	take(&q.Region, older.Region, "region")
+	if !q.hasCredential() {
+		take(&q.ClientID, older.ClientID, "client_id")
+		take(&q.ClientSecret, older.ClientSecret, "client_secret")
+		take(&q.Token, older.Token, "token")
+	}
+	if !q.namesDeployment() {
+		take(&q.Endpoint, older.Endpoint, "endpoint")
+		take(&q.Region, older.Region, "region")
+	}
+	// The token endpoint is not an alternative to anything; it qualifies whatever
+	// credential won.
 	take(&q.OAuthURL, older.OAuthURL, "oauth_url")
 	return used
 }
