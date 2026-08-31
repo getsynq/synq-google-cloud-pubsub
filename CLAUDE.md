@@ -29,16 +29,21 @@ golines -w -m 150 .
 
 Understanding the sync flow when modifying code:
 
-1. `runSync()` (main.go:90) - Cobra command handler, sets up context and logging
-2. `syncResources()` (main.go:394) - Main orchestration
-3. `syncTopics()` (main.go:414) - Iterates topics, filters, creates entities, returns accepted topic IDs
-4. `syncSubscriptions()` (main.go:465) - Filters by accepted topics, creates entities, queues relationships
-5. `manageRelationships()` (main.go:569) - Creates/deletes with deduplication
-6. `updateEntityGroup()` (main.go:657) - Updates group for automatic cleanup
+1. `runSync()` - Cobra command handler, sets up context and logging
+2. `syncResources()` - Main orchestration
+3. `syncTopics()` - Iterates topics, filters, creates entities, returns accepted topic IDs
+4. `syncSubscriptions()` - Filters by accepted topics, creates entities, queues relationships
+5. `manageRelationships()` - Reconciles edges (see the reconciliation rules below)
+6. `updateEntityGroup()` - Updates group for automatic cleanup
 
 **Important patterns:**
 - All `must*` functions exit with `os.Exit(1)` on fatal errors (don't return errors)
 - Context cancellation checked in iterator loops via `checkCancellation()`
+- Cancellation is not a destructive path, despite the partial inventory a
+  cancelled scan returns: `manageRelationships` and `updateEntityGroup` issue
+  their gRPC calls with the same context, and gRPC fails a call on a done
+  context before the wire, so the run exits 1 instead of reconciling from what
+  it managed to scan
 - GCP iterators use `iterator.Done` pattern for completion
 
 ### Custom Entities API Patterns
@@ -111,21 +116,19 @@ type Filter interface {
 
 ### Testing Patterns
 
-Uses testify/suite:
-```go
-type FilterSuite struct {
-    suite.Suite
-}
+`filter_test.go` uses testify/suite; everything written since uses plain
+`func TestX(t *testing.T)` with `assert`/`require`. Prefer the plain form: one
+named test per rule, its comment saying which rule and why it exists.
 
-func TestFilterSuite(t *testing.T) {
-    suite.Run(t, new(FilterSuite))
-}
+**Testing a flag** needs its own flag set. `LoadConfig` reads the global
+`pflag.CommandLine`, so swap in a fresh `pflag.NewFlagSet`, call `InitFlags()`,
+then `Parse` the args — `withFlags` in `config/config_test.go`.
 
-func (s *FilterSuite) TestFilter() {
-    s.Require().NoError(err)
-    s.True(condition)
-}
-```
+**Testing the deployment or the GCP project** means clearing the environment
+first, or the result depends on whose machine runs it: `clearDeploymentEnv`
+(`QUALITY_REGION`, `QUALITY_HOME`, …) and `noGCPProject` (`GCP_PROJECT_ID`,
+`CLOUDSDK_CONFIG`, and an empty `PATH` so gcloud is unreachable), both in
+`auth_test.go`.
 
 ### Authentication
 
