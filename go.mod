@@ -10,7 +10,6 @@ require (
 	github.com/getsynq/quality-oauth-go v0.1.1
 	github.com/joho/godotenv v1.5.1
 	github.com/pkg/errors v0.9.1
-	github.com/samber/lo v1.47.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0

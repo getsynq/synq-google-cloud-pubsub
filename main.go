@@ -19,7 +19,6 @@ import (
 	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
-	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -123,6 +122,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		)
 	}
 
+	// Filters are built before any client: a typo in a pattern should not cost a
+	// login and a Pub/Sub connection first.
+	filters, err := buildFilters(cfg)
+	if err != nil {
+		logger.ErrorContext(ctx, "Invalid filter configuration", slog.String("error", err.Error()))
+		return err
+	}
+
 	// Show dry-run mode warning
 	if cfg.DryRun {
 		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call the Coalesce Quality API")
@@ -148,9 +155,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 		// Setup entity types in Coalesce Quality
 		mustSetupEntityTypes(ctx, cfg, qualityClients.types)
 	}
-
-	// Build filters from configuration
-	filters := buildFilters(cfg)
 
 	// Sync Pub/Sub resources to Coalesce Quality
 	stats := syncResources(ctx, cfg, pubsubClient, qualityClients, filters)
@@ -202,28 +206,50 @@ type syncStats struct {
 // Configuration and Setup
 // ============================================================================
 
-// buildFilters creates all filters from configuration
-func buildFilters(cfg *config.Config) *filters {
-	return &filters{
-		topics:        buildIncludeExcludeFilter(cfg.Filter.Topics),
-		subscriptions: buildIncludeExcludeFilter(cfg.Filter.Subscriptions),
-		relationships: buildIncludeExcludeFilter(cfg.Relationships.Filter),
+// buildFilters creates all filters from configuration. A pattern is user input,
+// so one that will not compile is a configuration error naming the key it came
+// from, not a panic out of the middle of a sync.
+func buildFilters(cfg *config.Config) (*filters, error) {
+	topics, err := buildIncludeExcludeFilter("filter.topics", cfg.Filter.Topics)
+	if err != nil {
+		return nil, err
 	}
+	subscriptions, err := buildIncludeExcludeFilter("filter.subscriptions", cfg.Filter.Subscriptions)
+	if err != nil {
+		return nil, err
+	}
+	relationships, err := buildIncludeExcludeFilter("relationships.filter", cfg.Relationships.Filter)
+	if err != nil {
+		return nil, err
+	}
+	return &filters{topics: topics, subscriptions: subscriptions, relationships: relationships}, nil
 }
 
-// buildIncludeExcludeFilter creates a filter from include/exclude patterns
-func buildIncludeExcludeFilter(rules config.FilterRules) Filter {
-	var includeFilters []Filter
-	for _, pattern := range rules.Include {
-		includeFilters = append(includeFilters, lo.Must(NewRegexFilter(pattern)))
+// buildIncludeExcludeFilter creates a filter from include/exclude patterns.
+// section is the configuration key the rules came from, so a bad pattern sends
+// the reader to the right one of the three.
+func buildIncludeExcludeFilter(section string, rules config.FilterRules) (Filter, error) {
+	compile := func(key string, patterns []string) ([]Filter, error) {
+		var compiled []Filter
+		for _, pattern := range patterns {
+			filter, err := NewRegexFilter(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("%s.%s: invalid pattern %q: %w", section, key, pattern, err)
+			}
+			compiled = append(compiled, filter)
+		}
+		return compiled, nil
 	}
 
-	var excludeFilters []Filter
-	for _, pattern := range rules.Exclude {
-		excludeFilters = append(excludeFilters, lo.Must(NewRegexFilter(pattern)))
+	includeFilters, err := compile("include", rules.Include)
+	if err != nil {
+		return nil, err
 	}
-
-	return NewIncludeExcludeFilter(includeFilters, excludeFilters)
+	excludeFilters, err := compile("exclude", rules.Exclude)
+	if err != nil {
+		return nil, err
+	}
+	return NewIncludeExcludeFilter(includeFilters, excludeFilters), nil
 }
 
 // ============================================================================
