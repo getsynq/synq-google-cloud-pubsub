@@ -66,9 +66,14 @@ default, and an empty desired set used to mean "delete every stored
 topic-to-subscription edge", which wiped another integration's lineage from a
 live workspace.
 
-- `manageRelationships` is only called when `relationships.enabled` or
-  `relationships.prune`.
-- A run that computed no relationships withdraws none.
+- `relationshipModeFor` states what the run does — off, reconcile or prune — and
+  `reconcileRelationships` acts on that and nothing else. Off is the default and
+  withdraws nothing; it is the rule the released bug broke.
+- The mode is stated rather than inferred from an empty desired set, which
+  answers a different question and got this wrong twice: a plain run computes no
+  edges *and so does* a topic whose last subscription was deleted, where
+  withdrawing is the whole point. The same inference also let an unrelated
+  BigQuery edge decide whether filtered topic edges were withdrawn.
 - `ownedEdge` is the shape test: a subscription's id is its topic's id plus the
   subscription name, so an edge to anything else touching that topic belongs to
   another producer. The same two cuts hand back the topic and subscription names
@@ -85,16 +90,18 @@ live workspace.
   `staleRelationships` uses its emptiness as the sentinel, so an excluded topic
   edge was withdrawn whenever an unrelated delivery edge happened to exist.
 
-`relationships_test.go` covers all four; the first test in it is the reproducer
-for the released bug, and `TestAStaleSubscriptionEdgeIsDeleted` /
-`TestAFilteredSubscriptionKeepsItsEdge` are the pair that pins the fourth apart.
+`relationships_test.go` covers all four. The first test is the reproducer for
+the released bug; the pairs that pin a rule apart from its opposite are
+`TestNothingIsDeletedWhenRelationshipsAreOff` /
+`TestTheLastSubscriptionOfATopicLosesItsEdge` for the mode, and
+`TestAStaleSubscriptionEdgeIsDeleted` / `TestAFilteredSubscriptionKeepsItsEdge`
+for the filters.
 
 **Why the feature is off by default**, and why `--relationships.prune` exists:
 linking a topic to its subscriptions closes a cycle for every service that
 consumes a topic it also publishes, so the catalog becomes hard to follow. Prune
-is an explicit instruction to withdraw what this integration published, which is
-why it may delete where a plain run with an empty desired set may not — it is
-still held to `ownedEdge` and `withdrawableRelationships`.
+is an explicit instruction to withdraw what this integration published and create
+nothing, and it is still held to `ownedEdge` and `withdrawableRelationships`.
 
 ### Resource Filtering Implementation
 

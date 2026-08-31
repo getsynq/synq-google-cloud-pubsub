@@ -414,7 +414,7 @@ integration published and creates none.
 
 A run only ever withdraws relationships **it computed itself**:
 
-- Relationships are off by default, and a run that computed none withdraws none.
+- Relationships are off by default, and a run with them off withdraws none. With them on, a topic whose last subscription was deleted does lose that edge: reconciling is what the feature is for.
 - Only an edge from a topic to one of *its own* subscriptions belongs to this integration. A service catalog's edge into a topic, or a bucket's notification edge, is another producer's and is left alone.
 - Only edges between a topic this run scanned and a subscription its filters accept are judged, so a subscription excluded by a filter — or a relationship excluded by `relationships.filter` — keeps its lineage instead of reading as removed. A subscription that is simply gone from Pub/Sub still has its edge withdrawn: that is the reconciliation the feature is for.
 

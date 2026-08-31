@@ -451,7 +451,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
-		if cfg.Relationships.Enabled || cfg.Relationships.Prune {
+		if mode := relationshipModeFor(cfg); mode != relationshipsOff {
 			manageRelationships(
 				ctx,
 				clients.relationships,
@@ -460,7 +460,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 				acceptedTopics,
 				filters.subscriptions,
 				filters.relationships,
-				cfg.Relationships.Prune,
+				mode,
 			)
 		}
 		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
@@ -721,11 +721,8 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 
 // manageRelationships reconciles the topic-to-subscription edges.
 //
-// prune inverts it: the run withdraws every edge it owns and creates none. That
-// is an explicit instruction rather than an empty desired set, which is why it
-// is allowed to delete where a plain run with nothing to create is not — the
-// operator asked for the graph to lose these edges, having decided the topic and
-// its subscriptions read better apart.
+// What it is allowed to withdraw is relationshipMode's answer, not something
+// inferred from how much this run happened to compute.
 func manageRelationships(
 	ctx context.Context,
 	client entitiescustomv1grpc.RelationshipsServiceClient,
@@ -734,7 +731,7 @@ func manageRelationships(
 	acceptedTopicIds map[string]bool,
 	subscriptionFilter Filter,
 	relationshipFilter Filter,
-	prune bool,
+	mode relationshipMode,
 ) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Retrieving existing relationships")
@@ -749,13 +746,7 @@ func manageRelationships(
 
 	withdrawable := withdrawableRelationships(listResp.Relationships, acceptedTopicIds, subscriptionFilter, relationshipFilter)
 
-	var toCreate, toDelete []*entitiescustomv1.Relationship
-	if prune {
-		toDelete = withdrawable
-	} else {
-		toCreate = missingRelationships(relationshipsToCreate, listResp.Relationships)
-		toDelete = staleRelationships(relationshipsToCreate, withdrawable)
-	}
+	toCreate, toDelete := reconcileRelationships(relationshipsToCreate, listResp.Relationships, withdrawable, mode)
 
 	logger.InfoContext(ctx, "Managing relationships",
 		slog.Int("to_create", len(toCreate)),
@@ -785,6 +776,58 @@ func manageRelationships(
 	}
 }
 
+// relationshipMode is what a run does to the topic-to-subscription edges. It is
+// stated rather than inferred, because the thing it used to be inferred from —
+// an empty desired set — answers a different question and got this wrong twice.
+//
+// Relationships are opt-in, so a plain run computes none, and reading that as
+// "everything stored is unwanted" is how this sync once deleted another
+// integration's edges. But a topic whose last subscription was deleted also
+// computes none, and withdrawing that edge is the whole point of the feature.
+// Only the mode separates them.
+type relationshipMode int
+
+const (
+	// relationshipsOff withdraws nothing and creates nothing. It is the default,
+	// and it is the rule the released bug broke.
+	relationshipsOff relationshipMode = iota
+	// relationshipsReconcile publishes the computed edges and withdraws the
+	// withdrawable ones it did not compute, including when it computed none.
+	relationshipsReconcile
+	// relationshipsPrune withdraws every withdrawable edge and creates none.
+	relationshipsPrune
+)
+
+// relationshipModeFor reads the mode out of the configuration. Prune outranks
+// enabled: asking to withdraw is unambiguous, and doing both would republish
+// what it just withdrew.
+func relationshipModeFor(cfg *config.Config) relationshipMode {
+	switch {
+	case cfg.Relationships.Prune:
+		return relationshipsPrune
+	case cfg.Relationships.Enabled:
+		return relationshipsReconcile
+	default:
+		return relationshipsOff
+	}
+}
+
+// reconcileRelationships decides what to publish and what to withdraw.
+func reconcileRelationships(
+	desired, stored, withdrawable []*entitiescustomv1.Relationship,
+	mode relationshipMode,
+) (toCreate, toDelete []*entitiescustomv1.Relationship) {
+	switch mode {
+	case relationshipsPrune:
+		return nil, withdrawable
+	case relationshipsReconcile:
+		return missingRelationships(desired, stored), staleRelationships(desired, withdrawable)
+	case relationshipsOff:
+		return nil, nil
+	}
+	return nil, nil
+}
+
 // missingRelationships returns the desired edges the workspace does not hold yet.
 // It is checked against everything stored, not only the withdrawable subset, so
 // an edge to a BigQuery table or a bucket is not upserted again on every run.
@@ -806,14 +849,10 @@ func missingRelationships(desired, stored []*entitiescustomv1.Relationship) []*e
 // staleRelationships returns the withdrawable edges this run did not compute:
 // the subscription behind them is gone from Pub/Sub, so the edge is drift.
 //
-// A run that computed nothing withdraws nothing. Relationships are opt-in, so the
-// desired set is empty on a plain run, and treating that as "everything stored is
-// unwanted" is how this sync deleted another integration's edges.
+// It does not second-guess an empty desired set. Whether this run may withdraw
+// anything is relationshipMode's answer, and the withdrawable set is already
+// bounded by what the run scanned and what its filters accept.
 func staleRelationships(desired, withdrawable []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
-	if len(desired) == 0 {
-		return nil
-	}
-
 	desiredSet := make(map[string]struct{}, len(desired))
 	for _, rel := range desired {
 		desiredSet[rel.String()] = struct{}{}
