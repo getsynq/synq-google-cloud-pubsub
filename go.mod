@@ -7,6 +7,7 @@ require (
 	buf.build/gen/go/getsynq/api/protocolbuffers/go v1.36.10-20251210075706-df73709706b7.1
 	cloud.google.com/go/compute/metadata v0.8.0
 	cloud.google.com/go/pubsub v1.50.0
+	github.com/getsynq/quality-oauth-go v0.1.1
 	github.com/joho/godotenv v1.5.1
 	github.com/pkg/errors v0.9.1
 	github.com/samber/lo v1.47.0
@@ -31,7 +32,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
-	github.com/getsynq/quality-oauth-go v0.1.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
