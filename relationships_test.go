@@ -44,18 +44,27 @@ func TestNothingIsDeletedWhenTheRunComputedNothing(t *testing.T) {
 }
 
 // TestAStaleSubscriptionEdgeIsDeleted keeps the reconciliation this tool is for:
-// a subscription that is gone from Pub/Sub leaves an edge behind, and this run
-// inventoried both of its ends, so it is this tool's to withdraw.
+// a subscription that is gone from Pub/Sub leaves an edge behind, and withdrawing
+// it is the job.
+//
+// It goes through the same two steps as a run, in the same order, because the
+// earlier version of this test called deduplicateRelationships on its own. The
+// deleted subscription has no entity to inventory, so the step before it dropped
+// the edge and the stale edge was never withdrawn.
 func TestAStaleSubscriptionEdgeIsDeleted(t *testing.T) {
+	inventoried := []*entitiesv1.Identifier{
+		customID("pubsub::topic"),
+		customID("pubsub::topic::topic.live.subscription"),
+	}
 	desired := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
 	}
-	existing := []*entitiescustomv1.Relationship{
+	stored := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
 		edge("pubsub::topic", "pubsub::topic::topic.retired.subscription"),
 	}
 
-	toCreate, toDelete := deduplicateRelationships(desired, existing)
+	toCreate, toDelete := deduplicateRelationships(desired, withinInventory(stored, inventoried))
 
 	assert.Empty(t, toCreate, "an edge that already exists is not created again")
 	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.retired.subscription"}, edgeKeys(toDelete))
