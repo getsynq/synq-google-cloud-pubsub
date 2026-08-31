@@ -67,18 +67,24 @@ live workspace.
 - `ownsRelationship` is the shape test: a subscription's id is its topic's id plus
   the subscription name, so an edge to anything else touching that topic belongs
   to another producer.
-- `withinInventory` drops edges whose ends this run never saw, so a filtered
-  subscription keeps its lineage.
+- `withdrawableRelationships` keeps only the edges this run is answerable for:
+  between a topic it scanned and a subscription its configuration would have
+  published. The subscription end is judged by the **filter**, not by whether an
+  entity for it was inventoried, because the two reasons a subscription has no
+  entity are opposites — excluded by configuration means leave the edge alone,
+  deleted from Pub/Sub means withdraw it. Judging by the inventory made every
+  deleted subscription leak its edge forever.
 
 `relationships_test.go` covers all four; the first test in it is the reproducer
-for the released bug.
+for the released bug, and `TestAStaleSubscriptionEdgeIsDeleted` /
+`TestAFilteredSubscriptionKeepsItsEdge` are the pair that pins the fourth apart.
 
 **Why the feature is off by default**, and why `--relationships.prune` exists:
 linking a topic to its subscriptions closes a cycle for every service that
 consumes a topic it also publishes, so the catalog becomes hard to follow. Prune
 is an explicit instruction to withdraw what this integration published, which is
 why it may delete where a plain run with an empty desired set may not — it is
-still held to `ownsRelationship` and `withinInventory`.
+still held to `ownsRelationship` and `withdrawableRelationships`.
 
 ### Resource Filtering Implementation
 
@@ -138,7 +144,7 @@ everywhere.
 
 - Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`
 - Entity groups enable automatic cleanup via API's automatic deletion of entities not in new group
-- Relationships are only withdrawn for topic-to-subscription edges this run inventoried (see above)
+- Relationships are only withdrawn for topic-to-subscription edges this run is configured to manage (see above)
 - Icons validated as valid SVG XML before use
 - Version info injected via ldflags: `version`, `commit`, `date`
 - Context cancellation propagates to all operations for graceful shutdown

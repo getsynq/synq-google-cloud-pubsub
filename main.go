@@ -427,7 +427,15 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
 		if cfg.Relationships.Enabled || cfg.Relationships.Prune {
-			manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate, cfg.Relationships.Prune)
+			manageRelationships(
+				ctx,
+				clients.relationships,
+				createdEntities,
+				relationshipsToCreate,
+				acceptedTopics,
+				filters.subscriptions,
+				cfg.Relationships.Prune,
+			)
 		}
 		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
 	}
@@ -685,7 +693,6 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 // Relationship Management
 // ============================================================================
 
-// manageRelationships creates and deletes relationships as needed
 // manageRelationships reconciles the topic-to-subscription edges.
 //
 // prune inverts it: the run withdraws every edge it owns and creates none. That
@@ -698,6 +705,8 @@ func manageRelationships(
 	client entitiescustomv1grpc.RelationshipsServiceClient,
 	createdEntities []*entitiesv1.Identifier,
 	relationshipsToCreate []*entitiescustomv1.Relationship,
+	acceptedTopicIds map[string]bool,
+	subscriptionFilter Filter,
 	prune bool,
 ) {
 	logger := slog.Default()
@@ -711,13 +720,14 @@ func manageRelationships(
 		os.Exit(1)
 	}
 
-	inventoried := withinInventory(listResp.Relationships, createdEntities)
+	withdrawable := withdrawableRelationships(listResp.Relationships, acceptedTopicIds, subscriptionFilter)
 
 	var toCreate, toDelete []*entitiescustomv1.Relationship
 	if prune {
-		toDelete = ownedRelationships(inventoried)
+		toDelete = withdrawable
 	} else {
-		toCreate, toDelete = deduplicateRelationships(relationshipsToCreate, inventoried)
+		toCreate = missingRelationships(relationshipsToCreate, listResp.Relationships)
+		toDelete = staleRelationships(relationshipsToCreate, withdrawable)
 	}
 
 	logger.InfoContext(ctx, "Managing relationships",
@@ -748,48 +758,47 @@ func manageRelationships(
 	}
 }
 
-// deduplicateRelationships filters out existing relationships and finds ones to delete
-func deduplicateRelationships(
-	toCreate []*entitiescustomv1.Relationship,
-	existing []*entitiescustomv1.Relationship,
-) ([]*entitiescustomv1.Relationship, []*entitiescustomv1.Relationship) {
-	toCreateMap := make(map[string]struct{})
-	existingMap := make(map[string]struct{})
-
-	for _, rel := range existing {
-		existingMap[rel.String()] = struct{}{}
+// missingRelationships returns the desired edges the workspace does not hold yet.
+// It is checked against everything stored, not only the withdrawable subset, so
+// an edge to a BigQuery table or a bucket is not upserted again on every run.
+func missingRelationships(desired, stored []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
+	storedSet := make(map[string]struct{}, len(stored))
+	for _, rel := range stored {
+		storedSet[rel.String()] = struct{}{}
 	}
 
-	for _, rel := range toCreate {
-		toCreateMap[rel.String()] = struct{}{}
-	}
-
-	// Filter out relationships that already exist
-	var cleanedToCreate []*entitiescustomv1.Relationship
-	for _, rel := range toCreate {
-		if _, exists := existingMap[rel.String()]; !exists {
-			cleanedToCreate = append(cleanedToCreate, rel)
+	var missing []*entitiescustomv1.Relationship
+	for _, rel := range desired {
+		if _, exists := storedSet[rel.String()]; !exists {
+			missing = append(missing, rel)
 		}
 	}
+	return missing
+}
 
-	// A run that computed nothing withdraws nothing. Relationships are opt-in, so
-	// the desired set is empty on a plain run, and treating that as "everything
-	// stored is unwanted" is how this sync deleted another integration's edges.
-	if len(toCreate) == 0 {
-		return cleanedToCreate, nil
+// staleRelationships returns the withdrawable edges this run did not compute:
+// the subscription behind them is gone from Pub/Sub, so the edge is drift.
+//
+// A run that computed nothing withdraws nothing. Relationships are opt-in, so the
+// desired set is empty on a plain run, and treating that as "everything stored is
+// unwanted" is how this sync deleted another integration's edges.
+func staleRelationships(desired, withdrawable []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
+	if len(desired) == 0 {
+		return nil
 	}
 
-	// Find relationships to delete (exist but shouldn't)
-	var toDelete []*entitiescustomv1.Relationship
-	for _, rel := range existing {
-		if ownsRelationship(rel) {
-			if _, exists := toCreateMap[rel.String()]; !exists {
-				toDelete = append(toDelete, rel)
-			}
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, rel := range desired {
+		desiredSet[rel.String()] = struct{}{}
+	}
+
+	var stale []*entitiescustomv1.Relationship
+	for _, rel := range withdrawable {
+		if _, exists := desiredSet[rel.String()]; !exists {
+			stale = append(stale, rel)
 		}
 	}
-
-	return cleanedToCreate, toDelete
+	return stale
 }
 
 // ownsRelationship reports whether this integration is the producer of rel: an
@@ -808,36 +817,36 @@ func ownsRelationship(rel *entitiescustomv1.Relationship) bool {
 	return strings.HasPrefix(rel.Downstream.GetCustom().GetId(), topic+"::")
 }
 
-// ownedRelationships keeps the edges this integration is the producer of.
-func ownedRelationships(rels []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
-	var owned []*entitiescustomv1.Relationship
-	for _, rel := range rels {
-		if ownsRelationship(rel) {
-			owned = append(owned, rel)
-		}
-	}
-	return owned
-}
-
-// withinInventory keeps only the relationships whose both ends this run actually
-// inventoried. A subscription excluded by a filter is not this run's to judge, so
-// its edge is left where it is rather than read as drift.
-func withinInventory(
+// withdrawableRelationships keeps the stored edges this run is answerable for:
+// ones it is the producer of, between a topic it scanned and a subscription its
+// configuration would have published had that subscription still existed.
+//
+// The subscription end is judged by the filter rather than by whether the run
+// inventoried an entity for it, because the two reasons a subscription has no
+// entity are opposites. Excluded by configuration means the edge is not this
+// run's to touch; deleted from Pub/Sub means the edge is exactly what this run
+// exists to withdraw.
+func withdrawableRelationships(
 	rels []*entitiescustomv1.Relationship,
-	inventoried []*entitiesv1.Identifier,
+	acceptedTopicIds map[string]bool,
+	subscriptionFilter Filter,
 ) []*entitiescustomv1.Relationship {
-	seen := make(map[string]bool, len(inventoried))
-	for _, id := range inventoried {
-		seen[id.GetCustom().GetId()] = true
-	}
-
-	var kept []*entitiescustomv1.Relationship
+	var withdrawable []*entitiescustomv1.Relationship
 	for _, rel := range rels {
-		if seen[rel.Upstream.GetCustom().GetId()] && seen[rel.Downstream.GetCustom().GetId()] {
-			kept = append(kept, rel)
+		if !ownsRelationship(rel) {
+			continue
 		}
+		topicEntity := rel.Upstream.GetCustom().GetId()
+		if !acceptedTopicIds[strings.TrimPrefix(topicEntity, "pubsub::")] {
+			continue
+		}
+		subscription := strings.TrimPrefix(rel.Downstream.GetCustom().GetId(), topicEntity+"::")
+		if !subscriptionFilter.Accept(subscription) {
+			continue
+		}
+		withdrawable = append(withdrawable, rel)
 	}
-	return kept
+	return withdrawable
 }
 
 // ============================================================================

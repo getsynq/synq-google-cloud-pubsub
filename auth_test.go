@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	qualityoauth "github.com/getsynq/quality-oauth-go"
+	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

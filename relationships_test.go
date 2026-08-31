@@ -6,6 +6,7 @@ import (
 	entitiescustomv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/custom/v1"
 	entitiesv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func customID(id string) *entitiesv1.Identifier {
@@ -26,6 +27,30 @@ func edgeKeys(rels []*entitiescustomv1.Relationship) []string {
 	return keys
 }
 
+// acceptAll is the subscription filter of a run that configures no filters.
+func acceptAll() Filter {
+	return NewIncludeExcludeFilter(nil, nil)
+}
+
+// excluding builds the subscription filter of a run configured to skip a pattern.
+func excluding(t *testing.T, pattern string) Filter {
+	t.Helper()
+	exclude, err := NewRegexFilter(pattern)
+	require.NoError(t, err)
+	return NewIncludeExcludeFilter(nil, []Filter{exclude})
+}
+
+// reconcile runs the two steps manageRelationships runs, in its order, so a test
+// exercises the path a sync takes rather than one helper in isolation.
+func reconcile(
+	desired, stored []*entitiescustomv1.Relationship,
+	acceptedTopicIds map[string]bool,
+	subscriptionFilter Filter,
+) (toCreate, toDelete []*entitiescustomv1.Relationship) {
+	withdrawable := withdrawableRelationships(stored, acceptedTopicIds, subscriptionFilter)
+	return missingRelationships(desired, stored), staleRelationships(desired, withdrawable)
+}
+
 // TestNothingIsDeletedWhenTheRunComputedNothing is the reproducer for a sync
 // that wiped another tool's lineage from a live workspace.
 //
@@ -34,11 +59,11 @@ func edgeKeys(rels []*entitiescustomv1.Relationship) []string {
 // whoever had written it, so a routine `synq-google-cloud-pubsub` run with no
 // flags deleted seven edges another integration had just published.
 func TestNothingIsDeletedWhenTheRunComputedNothing(t *testing.T) {
-	existing := []*entitiescustomv1.Relationship{
+	stored := []*entitiescustomv1.Relationship{
 		edge("pubsub::prod.gcs.artefacts", "pubsub::prod.gcs.artefacts::prod.gcs.artefacts.consumer.subscription"),
 	}
 
-	_, toDelete := deduplicateRelationships(nil, existing)
+	_, toDelete := reconcile(nil, stored, map[string]bool{"prod.gcs.artefacts": true}, acceptAll())
 
 	assert.Empty(t, edgeKeys(toDelete), "a run that computed no relationships must not delete any")
 }
@@ -47,15 +72,11 @@ func TestNothingIsDeletedWhenTheRunComputedNothing(t *testing.T) {
 // a subscription that is gone from Pub/Sub leaves an edge behind, and withdrawing
 // it is the job.
 //
-// It goes through the same two steps as a run, in the same order, because the
-// earlier version of this test called deduplicateRelationships on its own. The
-// deleted subscription has no entity to inventory, so the step before it dropped
-// the edge and the stale edge was never withdrawn.
+// The deleted subscription has no entity for the run to inventory, which is why
+// the withdrawable set is decided by the subscription filter and not by the
+// inventory: judging it by the inventory left the stale edge in the workspace on
+// every subsequent run.
 func TestAStaleSubscriptionEdgeIsDeleted(t *testing.T) {
-	inventoried := []*entitiesv1.Identifier{
-		customID("pubsub::topic"),
-		customID("pubsub::topic::topic.live.subscription"),
-	}
 	desired := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
 	}
@@ -64,7 +85,7 @@ func TestAStaleSubscriptionEdgeIsDeleted(t *testing.T) {
 		edge("pubsub::topic", "pubsub::topic::topic.retired.subscription"),
 	}
 
-	toCreate, toDelete := deduplicateRelationships(desired, withinInventory(stored, inventoried))
+	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll())
 
 	assert.Empty(t, toCreate, "an edge that already exists is not created again")
 	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.retired.subscription"}, edgeKeys(toDelete))
@@ -78,7 +99,7 @@ func TestAnotherProducersEdgeSurvives(t *testing.T) {
 	desired := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
 	}
-	existing := []*entitiescustomv1.Relationship{
+	stored := []*entitiescustomv1.Relationship{
 		// A service catalog links its microservice entity to the topic.
 		edge("pubsub::topic", "service::consumer"),
 		// A bucket's notification edge, published by the Cloud Storage integration.
@@ -87,7 +108,7 @@ func TestAnotherProducersEdgeSurvives(t *testing.T) {
 		edge("pubsub::topic", "pubsub::other::other.sub.subscription"),
 	}
 
-	_, toDelete := deduplicateRelationships(desired, existing)
+	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true, "other": true}, acceptAll())
 
 	assert.Empty(t, edgeKeys(toDelete))
 }
@@ -102,38 +123,76 @@ func TestOnlySubscriptionsOfTheirOwnTopicAreOwned(t *testing.T) {
 }
 
 // TestAFilteredSubscriptionKeepsItsEdge is the other half of "only judge what
-// this run saw": a subscription excluded by configuration is never inventoried,
-// so its edge must not read as drift.
+// this run is configured to manage": a subscription excluded by configuration is
+// not this run's to touch, so its edge must not read as drift. It is the case a
+// deleted subscription looks identical to from the inventory alone.
 func TestAFilteredSubscriptionKeepsItsEdge(t *testing.T) {
-	existing := []*entitiescustomv1.Relationship{
+	desired := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+	}
+	stored := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
 		edge("pubsub::topic", "pubsub::topic::topic.excluded.subscription"),
 	}
 
-	kept := withinInventory(existing, []*entitiesv1.Identifier{
-		customID("pubsub::topic"),
-		customID("pubsub::topic::topic.live.subscription"),
-	})
+	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`))
 
-	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.live.subscription"}, edgeKeys(kept))
+	assert.Empty(t, edgeKeys(toDelete))
+}
+
+// TestATopicThisRunNeverScannedKeepsItsEdges is the same rule one level up: a
+// topic excluded by configuration, or one the scan never reached, is not this
+// run's to judge either.
+func TestATopicThisRunNeverScannedKeepsItsEdges(t *testing.T) {
+	stored := []*entitiescustomv1.Relationship{
+		edge("pubsub::unscanned", "pubsub::unscanned::unscanned.sub.subscription"),
+	}
+
+	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, acceptAll())
+
+	assert.Empty(t, edgeKeys(withdrawable))
 }
 
 // TestPruneWithdrawsOnlyWhatThisToolPublished covers the way back out. Turning
 // relationships on was a deliberate act and so is undoing it, so prune is allowed
 // to delete where a plain run with nothing to create is not — but it is still
-// held to the same shape and inventory rules.
+// held to the same ownership and configuration rules.
 func TestPruneWithdrawsOnlyWhatThisToolPublished(t *testing.T) {
-	existing := []*entitiescustomv1.Relationship{
+	stored := []*entitiescustomv1.Relationship{
 		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
-		edge("pubsub::topic", "pubsub::topic::topic.other.subscription"),
+		edge("pubsub::topic", "pubsub::topic::topic.retired.subscription"),
+		edge("pubsub::topic", "pubsub::topic::topic.excluded.subscription"),
 		edge("pubsub::topic", "service::consumer"),
 		edge("gcs::artefacts", "pubsub::topic"),
 	}
 
-	owned := ownedRelationships(existing)
+	// Prune deletes exactly the withdrawable set, computing nothing.
+	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`))
 
 	assert.Equal(t, []string{
 		"pubsub::topic->pubsub::topic::topic.live.subscription",
-		"pubsub::topic->pubsub::topic::topic.other.subscription",
-	}, edgeKeys(owned))
+		"pubsub::topic->pubsub::topic::topic.retired.subscription",
+	}, edgeKeys(withdrawable))
+}
+
+// TestAnExistingCrossPlatformEdgeIsNotUpsertedAgain guards the create side. A
+// BigQuery or bucket edge is not one this tool may withdraw, so it is absent
+// from the withdrawable set; checking the creates against that set instead of
+// against everything stored would republish it on every run.
+func TestAnExistingCrossPlatformEdgeIsNotUpsertedAgain(t *testing.T) {
+	bq := &entitiescustomv1.Relationship{
+		Upstream: customID("pubsub::topic::topic.live.subscription"),
+		Downstream: &entitiesv1.Identifier{
+			Id: &entitiesv1.Identifier_BigqueryTable{
+				BigqueryTable: &entitiesv1.BigqueryTableIdentifier{Project: "p", Dataset: "d", Table: "t"},
+			},
+		},
+	}
+	desired := []*entitiescustomv1.Relationship{bq}
+	stored := []*entitiescustomv1.Relationship{bq}
+
+	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll())
+
+	assert.Empty(t, toCreate)
+	assert.Empty(t, toDelete)
 }
