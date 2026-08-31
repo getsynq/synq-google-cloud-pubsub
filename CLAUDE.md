@@ -137,7 +137,14 @@ everywhere.
 - Read environment variables through `qualityoauth.Getenv`, never `os.Getenv`, or
   that one setting stops honouring its `SYNQ_`-prefixed alias.
 - Precedence is the library's, not this repo's: `Sources.Resolve` decides, and
-  `auth_test.go` pins the tiers so a local change cannot quietly diverge.
+  `auth_test.go` pins the tiers so a local change cannot quietly diverge. A tier
+  never vetoes a higher one: an unusable `quality.region` is an error only when
+  no flag supplied a deployment, and `LoadConfig` returns what it read alongside
+  a validation error so `auth login --region` keeps working on a machine with no
+  GCP project.
+- `oauth_url` must be HTTPS, loopback aside. It overrides the token endpoint for
+  whichever credentials the run resolved, the environment's included, so a config
+  file naming a plain-HTTP host is a credential-exfiltration primitive.
 - `App.FirstPartyClientID` stays empty. The authorization server seeds a client
   row per released first-party CLI and this is not one; an id it does not know is
   rejected at the authorize endpoint and the login then waits for a callback that

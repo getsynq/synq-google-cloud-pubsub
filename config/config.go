@@ -303,9 +303,12 @@ func LoadConfig(configPath string) (*Config, error) {
 		cfg.GCP.EntityGroupID = fmt.Sprintf("pubsub::%s", cfg.GCP.ProjectID)
 	}
 
-	// Validate required fields
+	// The config is returned alongside a validation error, not instead of it.
+	// Only a sync needs every field; `auth login` needs the deployment and
+	// nothing else, and it would otherwise lose the deployment to a missing GCP
+	// project it has no use for.
 	if err := validateConfig(cfg); err != nil {
-		return nil, err
+		return cfg, err
 	}
 
 	return cfg, nil

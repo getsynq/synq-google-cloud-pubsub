@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 
 	qualityoauth "github.com/getsynq/quality-oauth-go"
@@ -62,13 +64,23 @@ func authApp() qualityoauth.App {
 // Quality CLI does; the config file is offered as the configured endpoint, which
 // deliberately loses to a flag and to the environment.
 func resolveTarget(cfg *config.Config) (qualityoauth.Target, error) {
+	typed := cfg.Quality.RegionFlag != "" || cfg.Quality.EndpointFlag != ""
+
 	configured := cfg.Quality.Endpoint
 	if configured == "" && cfg.Quality.Region != "" {
 		target, err := qualityoauth.TargetForRegion(cfg.Quality.Region)
-		if err != nil {
+		switch {
+		case err == nil:
+			configured = target.Endpoint
+		case typed:
+			// A tier the user has overridden anyway must not veto the override.
+			slog.Default().Warn("Ignoring quality.region in the config file",
+				slog.String("region", cfg.Quality.Region),
+				slog.String("error", err.Error()),
+			)
+		default:
 			return qualityoauth.Target{}, fmt.Errorf("quality.region in the config file: %w", err)
 		}
-		configured = target.Endpoint
 	}
 	return qualityoauth.Sources{
 		RegionFlag:         cfg.Quality.RegionFlag,
@@ -155,11 +167,33 @@ func dialClientCredentials(
 // derived from the deployment; a config file that spells one out explicitly still
 // wins, because a self-hosted deployment can serve the authorization server from
 // somewhere other than the API host.
+//
+// An override has to be HTTPS. It is applied to whichever credentials the run
+// resolved, including a client id and secret exported into the environment, so a
+// config file naming a plain-HTTP host is a way to read them off the wire. The
+// loopback interface is the exception, because developing against a local
+// authorization server is not a downgrade.
 func tokenURL(derived, override string) (string, error) {
 	if override == "" {
 		return derived, nil
 	}
-	return override, nil
+	parsed, err := url.Parse(override)
+	if err != nil {
+		return "", fmt.Errorf("oauth_url %q is not a URL: %w", override, err)
+	}
+	if parsed.Scheme == "https" || isLoopback(parsed.Hostname()) {
+		return override, nil
+	}
+	return "", fmt.Errorf("oauth_url %q must use https; credentials are posted to it", override)
+}
+
+// isLoopback reports whether host addresses this machine.
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func dial(target qualityoauth.Target, authOpt grpc.DialOption) (*grpc.ClientConn, error) {
@@ -313,10 +347,14 @@ func targetFromCommand(cmd *cobra.Command) (qualityoauth.Target, error) {
 	configPath, _ := cmd.Flags().GetString("config")
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		// A sync needs a GCP project; logging in does not. Fall back to the
-		// deployment sources that do not depend on the file parsing.
+		// A sync needs a GCP project; logging in does not. LoadConfig hands back
+		// what it did read, so the deployment survives a failure that has nothing
+		// to do with it — losing it here logged the user into the default region
+		// while they were typing --region.
 		_, _ = fmt.Fprintf(os.Stderr, "warning: %v\n", err)
-		return qualityoauth.Sources{}.Resolve()
+		if cfg == nil {
+			return qualityoauth.Sources{}.Resolve()
+		}
 	}
 	return resolveTarget(cfg)
 }

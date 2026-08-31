@@ -105,9 +105,14 @@ func TestProjectIDIsStillRequired(t *testing.T) {
 	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
 	t.Setenv("PATH", "")
 
-	_, err := LoadConfig(writeConfig(t, "quality:\n  region: eu\n"))
+	cfg, err := LoadConfig(writeConfig(t, "quality:\n  region: eu\n"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GCP project ID is required")
+
+	// The error is returned alongside what was read, not instead of it. Only a
+	// sync needs a project; `auth login` needs the deployment and nothing else.
+	require.NotNil(t, cfg)
+	assert.Equal(t, "eu", cfg.Quality.Region)
 }
 
 // withFlags gives the test its own flag set, registered the way main does, and
