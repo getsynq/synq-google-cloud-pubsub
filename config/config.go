@@ -42,6 +42,20 @@ func flagValue(name string) string {
 	return flag.Value.String()
 }
 
+// firstFlagValue reads the first of names the user actually typed. Every
+// deprecated alias reaches its field through here rather than through the
+// unmarshal, which keys a `synq.client-id` flag as `synq.client-id` while the
+// field is `synq.client_id` and so drops the value: the aliases are only worth
+// accepting if what they carry arrives.
+func firstFlagValue(names ...string) string {
+	for _, name := range names {
+		if value := flagValue(name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 type QualityConfig struct {
 	ClientID     string `mapstructure:"client_id"`
 	ClientSecret string `mapstructure:"client_secret"`
@@ -272,14 +286,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	// The flags outrank the environment; the file values do not, so they are
 	// carried separately and resolved by the auth library.
 	cfg.Quality.RegionFlag = flagValue("region")
-	cfg.Quality.EndpointFlag = flagValue("endpoint")
-	if cfg.Quality.EndpointFlag == "" {
-		cfg.Quality.EndpointFlag = flagValue("synq.endpoint")
-	}
-	if id := flagValue("client-id"); id != "" {
+	cfg.Quality.EndpointFlag = firstFlagValue("endpoint", "synq.endpoint")
+	if id := firstFlagValue("client-id", "synq.client-id"); id != "" {
 		cfg.Quality.ClientID = id
 	}
-	if secret := flagValue("client-secret"); secret != "" {
+	if secret := firstFlagValue("client-secret", "synq.client-secret"); secret != "" {
 		cfg.Quality.ClientSecret = secret
 	}
 	if url := flagValue("synq.oauth-url"); url != "" {
