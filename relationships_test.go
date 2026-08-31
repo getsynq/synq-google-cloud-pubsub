@@ -114,12 +114,22 @@ func TestAnotherProducersEdgeSurvives(t *testing.T) {
 }
 
 // TestOnlySubscriptionsOfTheirOwnTopicAreOwned pins the shape test itself: a
-// subscription's id is its topic's id plus the subscription name.
+// subscription's id is its topic's id plus the subscription name. It pins the two
+// names that fall out of it as well, because the filters are applied to those.
 func TestOnlySubscriptionsOfTheirOwnTopicAreOwned(t *testing.T) {
-	assert.True(t, ownsRelationship(edge("pubsub::topic", "pubsub::topic::topic.sub.subscription")))
-	assert.False(t, ownsRelationship(edge("pubsub::topic", "pubsub::other::other.sub.subscription")))
-	assert.False(t, ownsRelationship(edge("pubsub::topic", "service::consumer")))
-	assert.False(t, ownsRelationship(edge("gcs::artefacts", "pubsub::topic")))
+	topic, subscription, ok := ownedEdge(edge("pubsub::topic", "pubsub::topic::topic.sub.subscription"))
+	assert.True(t, ok)
+	assert.Equal(t, "topic", topic)
+	assert.Equal(t, "topic.sub.subscription", subscription)
+
+	for _, rel := range []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::other::other.sub.subscription"),
+		edge("pubsub::topic", "service::consumer"),
+		edge("gcs::artefacts", "pubsub::topic"),
+	} {
+		_, _, ok := ownedEdge(rel)
+		assert.False(t, ok, edgeKeys([]*entitiescustomv1.Relationship{rel})[0])
+	}
 }
 
 // TestAFilteredSubscriptionKeepsItsEdge is the other half of "only judge what

@@ -801,20 +801,27 @@ func staleRelationships(desired, withdrawable []*entitiescustomv1.Relationship) 
 	return stale
 }
 
-// ownsRelationship reports whether this integration is the producer of rel: an
-// edge from a topic to one of its own subscriptions, which is the only shape it
-// publishes between two Pub/Sub entities.
+// ownedEdge takes rel apart into the topic and subscription names, and reports
+// whether this integration is its producer at all: an edge from a topic to one of
+// its own subscriptions is the only shape it publishes between two Pub/Sub
+// entities.
 //
-// A subscription's entity id is its topic's id plus the subscription name, so
-// the test is exactly that. Everything else the workspace holds around a topic —
-// a service catalog linking a consumer, a bucket's notification edge — belongs to
-// another producer, and withdrawing it makes every run undo their work.
-func ownsRelationship(rel *entitiescustomv1.Relationship) bool {
-	topic := rel.Upstream.GetCustom().GetId()
-	if !strings.HasPrefix(topic, "pubsub::") {
-		return false
+// A subscription's entity id is its topic's id plus the subscription name, so the
+// ownership test and the names fall out of the same two cuts. Everything else the
+// workspace holds around a topic — a service catalog linking a consumer, a
+// bucket's notification edge — belongs to another producer, and withdrawing it
+// makes every run undo their work.
+func ownedEdge(rel *entitiescustomv1.Relationship) (topic, subscription string, ok bool) {
+	topicEntity := rel.Upstream.GetCustom().GetId()
+	topic, ok = strings.CutPrefix(topicEntity, "pubsub::")
+	if !ok {
+		return "", "", false
 	}
-	return strings.HasPrefix(rel.Downstream.GetCustom().GetId(), topic+"::")
+	subscription, ok = strings.CutPrefix(rel.Downstream.GetCustom().GetId(), topicEntity+"::")
+	if !ok {
+		return "", "", false
+	}
+	return topic, subscription, true
 }
 
 // withdrawableRelationships keeps the stored edges this run is answerable for:
@@ -833,15 +840,8 @@ func withdrawableRelationships(
 ) []*entitiescustomv1.Relationship {
 	var withdrawable []*entitiescustomv1.Relationship
 	for _, rel := range rels {
-		if !ownsRelationship(rel) {
-			continue
-		}
-		topicEntity := rel.Upstream.GetCustom().GetId()
-		if !acceptedTopicIds[strings.TrimPrefix(topicEntity, "pubsub::")] {
-			continue
-		}
-		subscription := strings.TrimPrefix(rel.Downstream.GetCustom().GetId(), topicEntity+"::")
-		if !subscriptionFilter.Accept(subscription) {
+		topic, subscription, ok := ownedEdge(rel)
+		if !ok || !acceptedTopicIds[topic] || !subscriptionFilter.Accept(subscription) {
 			continue
 		}
 		withdrawable = append(withdrawable, rel)
