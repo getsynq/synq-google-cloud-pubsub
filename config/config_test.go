@@ -169,3 +169,58 @@ quality:
 	require.NoError(t, err)
 	assert.Equal(t, "typed.synq.io:443", cfg.Quality.EndpointFlag)
 }
+
+// TestALegacyClientPairDoesNotOverrideAPromotedToken is the reproducer for the
+// deprecated section winning. The merge fills each field on its own, so a
+// promoted `quality.token` beside a legacy client pair leaves all three set, and
+// connect tries a client pair before a token — so the section that is meant to
+// lose decides how the run authenticates.
+func TestALegacyClientPairDoesNotOverrideAPromotedToken(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `
+gcp:
+  project_id: example-project
+quality:
+  token: promoted-token
+synq:
+  client_id: legacy-id
+  client_secret: legacy-secret
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "promoted-token", cfg.Quality.Token)
+	assert.Empty(t, cfg.Quality.ClientID, "a credential is taken whole from one section")
+	assert.Empty(t, cfg.Quality.ClientSecret)
+}
+
+// TestALegacyEndpointDoesNotOverrideAPromotedRegion is the same rule for the
+// deployment: resolveTarget prefers an endpoint over a region, so a leftover
+// `synq.endpoint` decided which deployment was dialled.
+func TestALegacyEndpointDoesNotOverrideAPromotedRegion(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `
+gcp:
+  project_id: example-project
+quality:
+  region: us
+synq:
+  endpoint: developer.synq.io:443
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "us", cfg.Quality.Region)
+	assert.Empty(t, cfg.Quality.Endpoint, "the deployment is taken whole from one section")
+}
+
+// TestAHalfFilledQualitySectionIsStillCompleted keeps what the whole-source rule
+// must not break: a client id promoted without its secret is still a split
+// across the two sections, and both halves are needed.
+func TestAHalfFilledQualitySectionIsStillCompleted(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `
+gcp:
+  project_id: example-project
+quality:
+  client_id: promoted-id
+synq:
+  client_secret: legacy-secret
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "promoted-id", cfg.Quality.ClientID)
+	assert.Equal(t, "legacy-secret", cfg.Quality.ClientSecret)
+}
