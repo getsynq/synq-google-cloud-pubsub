@@ -418,6 +418,8 @@ A run only ever withdraws relationships **it computed itself**:
 - Only an edge from a topic to one of *its own* subscriptions belongs to this integration. A service catalog's edge into a topic, or a bucket's notification edge, is another producer's and is left alone.
 - Only edges between a topic this run scanned and a subscription its filters accept are judged, so a subscription excluded by a filter — or a relationship excluded by `relationships.filter` — keeps its lineage instead of reading as removed. A subscription that is simply gone from Pub/Sub still has its edge withdrawn: that is the reconciliation the feature is for.
 
+**Cycles:** each integration only withdraws the relationship shape it publishes, so the two never undo each other. With both relationship features enabled, a bucket that notifies a topic whose subscription writes back to that same bucket forms a three-hop cycle in the graph. That is a faithful picture of the delivery path rather than a fault, but it is worth knowing before you read it as one.
+
 **Custom Identifiers:** All entities use custom identifiers with `pubsub::` prefix for namespace isolation. Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`.
 
 ## Development
