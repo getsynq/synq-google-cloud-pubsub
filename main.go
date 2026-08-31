@@ -839,22 +839,29 @@ func ownedEdge(rel *entitiescustomv1.Relationship) (topic, subscription string, 
 // ones it is the producer of, between a topic it scanned and a subscription its
 // configuration would have published had that subscription still existed.
 //
-// The subscription end is judged by the filter rather than by whether the run
-// inventoried an entity for it, because the two reasons a subscription has no
-// entity are opposites. Excluded by configuration means the edge is not this
-// run's to touch; deleted from Pub/Sub means the edge is exactly what this run
-// exists to withdraw.
+// Both ends are judged by the filters rather than by whether the run inventoried
+// an entity, because the two reasons an edge has no entity behind it are
+// opposites. Excluded by configuration means the edge is not this run's to touch;
+// deleted from Pub/Sub means the edge is exactly what this run exists to
+// withdraw.
+//
+// The relationship filter is consulted for the same reason the subscription one
+// is, and because the alternative was incoherent: the desired set mixes these
+// edges with the delivery edges, so an excluded edge was withdrawn whenever an
+// unrelated BigQuery or bucket edge happened to exist, and kept when none did.
 func withdrawableRelationships(
 	rels []*entitiescustomv1.Relationship,
 	acceptedTopicIds map[string]bool,
 	subscriptionFilter Filter,
 	relationshipFilter Filter,
 ) []*entitiescustomv1.Relationship {
-	_ = relationshipFilter
 	var withdrawable []*entitiescustomv1.Relationship
 	for _, rel := range rels {
 		topic, subscription, ok := ownedEdge(rel)
 		if !ok || !acceptedTopicIds[topic] || !subscriptionFilter.Accept(subscription) {
+			continue
+		}
+		if !relationshipFilter.Accept(topic + "->" + subscription) {
 			continue
 		}
 		withdrawable = append(withdrawable, rel)

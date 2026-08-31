@@ -70,11 +70,15 @@ live workspace.
   the filters below are applied to.
 - `withdrawableRelationships` keeps only the edges this run is answerable for:
   between a topic it scanned and a subscription its configuration would have
-  published. The subscription end is judged by the **filter**, not by whether an
-  entity for it was inventoried, because the two reasons a subscription has no
-  entity are opposites — excluded by configuration means leave the edge alone,
-  deleted from Pub/Sub means withdraw it. Judging by the inventory made every
-  deleted subscription leak its edge forever.
+  published. Both ends are judged by the **filters** — the subscription filter
+  and the relationship filter — not by whether an entity was inventoried, because
+  the two reasons an edge has no entity behind it are opposites: excluded by
+  configuration means leave the edge alone, deleted from Pub/Sub means withdraw
+  it. Judging by the inventory made every deleted subscription leak its edge
+  forever. Skipping the relationship filter here was worse than inconsistent: the
+  desired set mixes topic edges with the BigQuery and bucket ones, and
+  `staleRelationships` uses its emptiness as the sentinel, so an excluded topic
+  edge was withdrawn whenever an unrelated delivery edge happened to exist.
 
 `relationships_test.go` covers all four; the first test in it is the reproducer
 for the released bug, and `TestAStaleSubscriptionEdgeIsDeleted` /
