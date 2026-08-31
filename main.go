@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	_ "embed"
 	"encoding/xml"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	entitiescustomv1grpc "buf.build/gen/go/getsynq/api/grpc/go/synq/entities/custom/v1/customv1grpc"
 	entitiescustomv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/custom/v1"
@@ -19,14 +19,10 @@ import (
 	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
-	"github.com/samber/lo"
 	"github.com/spf13/cobra"
-	"golang.org/x/oauth2/clientcredentials"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -45,17 +41,21 @@ var (
 // ============================================================================
 
 var rootCmd = &cobra.Command{
-	Use:   "synq-google-cloud-pubsub",
-	Short: "Sync Google Cloud Pub/Sub resources to SYNQ",
-	Long: `A Google Cloud Pub/Sub integration that syncs topics and subscriptions
-as custom entities in the SYNQ platform.
+	Use:   toolName,
+	Short: "Sync Google Cloud Pub/Sub resources to Coalesce Quality",
+	Long: `A Google Cloud Pub/Sub integration that publishes topics and subscriptions
+as custom entities in Coalesce Quality.
 
 The tool supports configuration through:
   - YAML config file (config.yaml by default)
-  - Environment variables (SYNQ_CLIENT_ID, etc.)
+  - Environment variables (QUALITY_CLIENT_ID, etc.)
   - Command-line flags (highest precedence)
 
-Configuration precedence: defaults → config file → environment variables → flags`,
+Configuration precedence: defaults → config file → environment variables → flags
+
+Authenticate with a browser login (` + toolName + ` auth login), client
+credentials in QUALITY_CLIENT_ID and QUALITY_CLIENT_SECRET, or a pre-issued
+QUALITY_TOKEN. A browser login is shared with the other Coalesce Quality tools.`,
 	Version: version,
 	RunE:    runSync,
 }
@@ -64,7 +64,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("synq-google-cloud-pubsub %s\n", version)
+		fmt.Printf("%s %s\n", toolName, version)
 		fmt.Printf("  commit: %s\n", commit)
 		fmt.Printf("  built:  %s\n", date)
 	},
@@ -78,7 +78,7 @@ func main() {
 	config.InitFlags()
 
 	// Add subcommands
-	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(versionCmd, authCmd)
 
 	// Execute the root command
 	if err := rootCmd.Execute(); err != nil {
@@ -94,13 +94,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		ctx = context.Background()
 	}
 
-	// Setup context with cancellation and signal handling
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// SIGTERM is here because a scheduled run in a container is asked to stop
+	// that way, and os.Interrupt alone left those runs with no cancellation path.
+	// The scan loops report the cancellation themselves, through
+	// checkCancellation, so there is nothing to watch the context for here.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Setup logging and handle graceful shutdown
 	setupLogging(ctx)
-	handleShutdown(ctx, cancel)
 
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Starting Google Cloud Pub/Sub integration")
@@ -115,9 +116,23 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if len(cfg.DeprecatedKeys) > 0 {
+		logger.WarnContext(ctx, "Configuration uses superseded keys; the quality section replaces them",
+			slog.Any("keys", cfg.DeprecatedKeys),
+		)
+	}
+
+	// Filters are built before any client: a typo in a pattern should not cost a
+	// login and a Pub/Sub connection first.
+	filters, err := buildFilters(cfg)
+	if err != nil {
+		logger.ErrorContext(ctx, "Invalid filter configuration", slog.String("error", err.Error()))
+		return err
+	}
+
 	// Show dry-run mode warning
 	if cfg.DryRun {
-		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call SYNQ API")
+		logger.InfoContext(ctx, "DRY-RUN MODE: Will scan GCP resources but not call the Coalesce Quality API")
 	}
 
 	// Setup clients
@@ -128,24 +143,21 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	var synqClients *synqClients
+	var qualityClients *qualityClients
 	if !cfg.DryRun {
-		synqClients = mustCreateSYNQClients(ctx, cfg)
+		qualityClients = mustCreateQualityClients(ctx, cfg)
 		defer func() {
-			if err := synqClients.close(); err != nil {
-				logger.ErrorContext(ctx, "Error closing SYNQ clients", slog.String("error", err.Error()))
+			if err := qualityClients.close(); err != nil {
+				logger.ErrorContext(ctx, "Error closing Coalesce Quality clients", slog.String("error", err.Error()))
 			}
 		}()
 
-		// Setup entity types in SYNQ
-		mustSetupEntityTypes(ctx, cfg, synqClients.types)
+		// Setup entity types in Coalesce Quality
+		mustSetupEntityTypes(ctx, cfg, qualityClients.types)
 	}
 
-	// Build filters from configuration
-	filters := buildFilters(cfg)
-
-	// Sync Pub/Sub resources to SYNQ
-	stats := syncResources(ctx, cfg, pubsubClient, synqClients, filters)
+	// Sync Pub/Sub resources to Coalesce Quality
+	stats := syncResources(ctx, cfg, pubsubClient, qualityClients, filters)
 
 	logger.InfoContext(ctx, "Sync completed successfully",
 		slog.Int("topics", stats.Topics),
@@ -160,8 +172,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 // Types
 // ============================================================================
 
-// synqClients holds all SYNQ API clients
-type synqClients struct {
+// qualityClients holds every Coalesce Quality API client a sync uses
+type qualityClients struct {
 	conn          *grpc.ClientConn
 	types         entitiescustomv1grpc.TypesServiceClient
 	entities      entitiescustomv1grpc.EntitiesServiceClient
@@ -169,7 +181,7 @@ type synqClients struct {
 	groups        entitiescustomv1grpc.GroupsServiceClient
 }
 
-func (c *synqClients) close() error {
+func (c *qualityClients) close() error {
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -194,40 +206,50 @@ type syncStats struct {
 // Configuration and Setup
 // ============================================================================
 
-// handleShutdown sets up graceful shutdown on interrupt signal
-func handleShutdown(ctx context.Context, cancel context.CancelFunc) {
-	logger := slog.Default()
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt)
-		<-sigChan
-		logger.InfoContext(ctx, "Received interrupt signal, shutting down...")
-		cancel()
-	}()
+// buildFilters creates all filters from configuration. A pattern is user input,
+// so one that will not compile is a configuration error naming the key it came
+// from, not a panic out of the middle of a sync.
+func buildFilters(cfg *config.Config) (*filters, error) {
+	topics, err := buildIncludeExcludeFilter("filter.topics", cfg.Filter.Topics)
+	if err != nil {
+		return nil, err
+	}
+	subscriptions, err := buildIncludeExcludeFilter("filter.subscriptions", cfg.Filter.Subscriptions)
+	if err != nil {
+		return nil, err
+	}
+	relationships, err := buildIncludeExcludeFilter("relationships.filter", cfg.Relationships.Filter)
+	if err != nil {
+		return nil, err
+	}
+	return &filters{topics: topics, subscriptions: subscriptions, relationships: relationships}, nil
 }
 
-// buildFilters creates all filters from configuration
-func buildFilters(cfg *config.Config) *filters {
-	return &filters{
-		topics:        buildIncludeExcludeFilter(cfg.Filter.Topics),
-		subscriptions: buildIncludeExcludeFilter(cfg.Filter.Subscriptions),
-		relationships: buildIncludeExcludeFilter(cfg.Relationships.Filter),
-	}
-}
-
-// buildIncludeExcludeFilter creates a filter from include/exclude patterns
-func buildIncludeExcludeFilter(rules config.FilterRules) Filter {
-	var includeFilters []Filter
-	for _, pattern := range rules.Include {
-		includeFilters = append(includeFilters, lo.Must(NewRegexFilter(pattern)))
-	}
-
-	var excludeFilters []Filter
-	for _, pattern := range rules.Exclude {
-		excludeFilters = append(excludeFilters, lo.Must(NewRegexFilter(pattern)))
+// buildIncludeExcludeFilter creates a filter from include/exclude patterns.
+// section is the configuration key the rules came from, so a bad pattern sends
+// the reader to the right one of the three.
+func buildIncludeExcludeFilter(section string, rules config.FilterRules) (Filter, error) {
+	compile := func(key string, patterns []string) ([]Filter, error) {
+		var compiled []Filter
+		for _, pattern := range patterns {
+			filter, err := NewRegexFilter(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("%s.%s: invalid pattern %q: %w", section, key, pattern, err)
+			}
+			compiled = append(compiled, filter)
+		}
+		return compiled, nil
 	}
 
-	return NewIncludeExcludeFilter(includeFilters, excludeFilters)
+	includeFilters, err := compile("include", rules.Include)
+	if err != nil {
+		return nil, err
+	}
+	excludeFilters, err := compile("exclude", rules.Exclude)
+	if err != nil {
+		return nil, err
+	}
+	return NewIncludeExcludeFilter(includeFilters, excludeFilters), nil
 }
 
 // ============================================================================
@@ -249,38 +271,26 @@ func mustCreatePubSubClient(ctx context.Context, cfg *config.Config) *pubsub.Cli
 	return client
 }
 
-// mustCreateSYNQClients creates all SYNQ API clients or exits on error
-func mustCreateSYNQClients(ctx context.Context, cfg *config.Config) *synqClients {
+// mustCreateQualityClients resolves credentials and opens the API clients, or exits
+func mustCreateQualityClients(ctx context.Context, cfg *config.Config) *qualityClients {
 	logger := slog.Default()
-	logger.InfoContext(ctx, "Authenticating with SYNQ API", slog.String("endpoint", cfg.SYNQ.Endpoint))
 
-	host := strings.Split(cfg.SYNQ.Endpoint, ":")[0]
-
-	// Setup OAuth2
-	oauthConfig := &clientcredentials.Config{
-		ClientID:     cfg.SYNQ.ClientID,
-		ClientSecret: cfg.SYNQ.ClientSecret,
-		TokenURL:     cfg.SYNQ.OAuthURL,
-	}
-	oauthTokenSource := oauth.TokenSource{TokenSource: oauthConfig.TokenSource(ctx)}
-
-	// Setup gRPC connection
-	creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: false})
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
-		grpc.WithPerRPCCredentials(oauthTokenSource),
-		grpc.WithAuthority(host),
-	}
-
-	conn, err := grpc.NewClient(cfg.SYNQ.Endpoint, opts...)
+	target, err := resolveTarget(cfg)
 	if err != nil {
-		logger.ErrorContext(ctx, "Failed to connect to SYNQ API", slog.String("error", err.Error()))
+		logger.ErrorContext(ctx, "Could not resolve the Coalesce Quality deployment", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.InfoContext(ctx, "Authenticating with the Coalesce Quality API", slog.String("deployment", target.String()))
+
+	conn, err := connect(ctx, cfg, target)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to connect to the Coalesce Quality API", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	logger.InfoContext(ctx, "Successfully connected to SYNQ API")
+	logger.InfoContext(ctx, "Successfully connected to the Coalesce Quality API")
 
-	return &synqClients{
+	return &qualityClients{
 		conn:          conn,
 		types:         entitiescustomv1grpc.NewTypesServiceClient(conn),
 		entities:      entitiescustomv1grpc.NewEntitiesServiceClient(conn),
@@ -293,7 +303,7 @@ func mustCreateSYNQClients(ctx context.Context, cfg *config.Config) *synqClients
 // Entity Type Management
 // ============================================================================
 
-// mustSetupEntityTypes creates or updates entity types in SYNQ
+// mustSetupEntityTypes creates or updates the custom entity types
 func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient entitiescustomv1grpc.TypesServiceClient) {
 	logger := slog.Default()
 
@@ -308,7 +318,7 @@ func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient e
 	)
 
 	// Create/update entity types
-	logger.InfoContext(ctx, "Creating/updating entity types in SYNQ",
+	logger.InfoContext(ctx, "Creating/updating entity types in Coalesce Quality",
 		slog.Int("topic_type_id", int(cfg.Types.TopicTypeID)),
 		slog.Int("subscription_type_id", int(cfg.Types.SubscriptionTypeID)),
 	)
@@ -407,8 +417,8 @@ func validateSVG(data []byte) error {
 // Resource Sync
 // ============================================================================
 
-// syncResources syncs all Pub/Sub resources to SYNQ
-func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, clients *synqClients, filters *filters) syncStats {
+// syncResources publishes every Pub/Sub resource
+func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub.Client, clients *qualityClients, filters *filters) syncStats {
 	var entitiesClient entitiescustomv1grpc.EntitiesServiceClient
 	if clients != nil {
 		entitiesClient = clients.entities
@@ -428,11 +438,31 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 		}
 	}
 
-	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, entitiesClient, filters, acceptedTopics, &createdEntities, customEntities)
+	subscriptionCount, relationshipsToCreate := syncSubscriptions(
+		ctx,
+		cfg,
+		pubsubClient,
+		entitiesClient,
+		filters,
+		acceptedTopics,
+		&createdEntities,
+		customEntities,
+	)
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
-		manageRelationships(ctx, clients.relationships, createdEntities, relationshipsToCreate)
+		if mode := relationshipModeFor(cfg); mode != relationshipsOff {
+			manageRelationships(
+				ctx,
+				clients.relationships,
+				createdEntities,
+				relationshipsToCreate,
+				acceptedTopics,
+				filters.subscriptions,
+				filters.relationships,
+				mode,
+			)
+		}
 		updateEntityGroup(ctx, cfg, clients.groups, createdEntities)
 	}
 
@@ -443,7 +473,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 	}
 }
 
-// syncTopics syncs all topics from Pub/Sub to SYNQ
+// syncTopics publishes every topic
 func syncTopics(
 	ctx context.Context,
 	cfg *config.Config,
@@ -500,7 +530,7 @@ func syncTopics(
 	return createdEntities, acceptedTopicIds, topicCount
 }
 
-// syncSubscriptions syncs all subscriptions from Pub/Sub to SYNQ
+// syncSubscriptions publishes every subscription
 func syncSubscriptions(
 	ctx context.Context,
 	cfg *config.Config,
@@ -661,7 +691,7 @@ func syncSubscriptions(
 func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesServiceClient, id *entitiesv1.Identifier, typeID int32, name string) {
 	logger := slog.Default()
 
-	// Skip SYNQ API call in dry-run mode
+	// Skip the API call in dry-run mode
 	if client == nil {
 		logger.DebugContext(ctx, "[DRY-RUN] Would upsert entity",
 			slog.String("name", name),
@@ -689,12 +719,19 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 // Relationship Management
 // ============================================================================
 
-// manageRelationships creates and deletes relationships as needed
+// manageRelationships reconciles the topic-to-subscription edges.
+//
+// What it is allowed to withdraw is relationshipMode's answer, not something
+// inferred from how much this run happened to compute.
 func manageRelationships(
 	ctx context.Context,
 	client entitiescustomv1grpc.RelationshipsServiceClient,
 	createdEntities []*entitiesv1.Identifier,
 	relationshipsToCreate []*entitiescustomv1.Relationship,
+	acceptedTopicIds map[string]bool,
+	subscriptionFilter Filter,
+	relationshipFilter Filter,
+	mode relationshipMode,
 ) {
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Retrieving existing relationships")
@@ -707,8 +744,9 @@ func manageRelationships(
 		os.Exit(1)
 	}
 
-	// Deduplicate relationships
-	toCreate, toDelete := deduplicateRelationships(relationshipsToCreate, listResp.Relationships)
+	withdrawable := withdrawableRelationships(listResp.Relationships, acceptedTopicIds, subscriptionFilter, relationshipFilter)
+
+	toCreate, toDelete := reconcileRelationships(relationshipsToCreate, listResp.Relationships, withdrawable, mode)
 
 	logger.InfoContext(ctx, "Managing relationships",
 		slog.Int("to_create", len(toCreate)),
@@ -738,47 +776,152 @@ func manageRelationships(
 	}
 }
 
-// deduplicateRelationships filters out existing relationships and finds ones to delete
-func deduplicateRelationships(
-	toCreate []*entitiescustomv1.Relationship,
-	existing []*entitiescustomv1.Relationship,
-) ([]*entitiescustomv1.Relationship, []*entitiescustomv1.Relationship) {
-	toCreateMap := make(map[string]struct{})
-	existingMap := make(map[string]struct{})
+// relationshipMode is what a run does to the topic-to-subscription edges. It is
+// stated rather than inferred, because the thing it used to be inferred from —
+// an empty desired set — answers a different question and got this wrong twice.
+//
+// Relationships are opt-in, so a plain run computes none, and reading that as
+// "everything stored is unwanted" is how this sync once deleted another
+// integration's edges. But a topic whose last subscription was deleted also
+// computes none, and withdrawing that edge is the whole point of the feature.
+// Only the mode separates them.
+type relationshipMode int
 
-	for _, rel := range existing {
-		existingMap[rel.String()] = struct{}{}
+const (
+	// relationshipsOff withdraws nothing and creates nothing. It is the default,
+	// and it is the rule the released bug broke.
+	relationshipsOff relationshipMode = iota
+	// relationshipsReconcile publishes the computed edges and withdraws the
+	// withdrawable ones it did not compute, including when it computed none.
+	relationshipsReconcile
+	// relationshipsPrune withdraws every withdrawable edge and creates none.
+	relationshipsPrune
+)
+
+// relationshipModeFor reads the mode out of the configuration. Prune outranks
+// enabled: asking to withdraw is unambiguous, and doing both would republish
+// what it just withdrew.
+func relationshipModeFor(cfg *config.Config) relationshipMode {
+	switch {
+	case cfg.Relationships.Prune:
+		return relationshipsPrune
+	case cfg.Relationships.Enabled:
+		return relationshipsReconcile
+	default:
+		return relationshipsOff
 	}
-
-	for _, rel := range toCreate {
-		toCreateMap[rel.String()] = struct{}{}
-	}
-
-	// Filter out relationships that already exist
-	var cleanedToCreate []*entitiescustomv1.Relationship
-	for _, rel := range toCreate {
-		if _, exists := existingMap[rel.String()]; !exists {
-			cleanedToCreate = append(cleanedToCreate, rel)
-		}
-	}
-
-	// Find relationships to delete (exist but shouldn't)
-	var toDelete []*entitiescustomv1.Relationship
-	for _, rel := range existing {
-		if isPubSubRelationship(rel) {
-			if _, exists := toCreateMap[rel.String()]; !exists {
-				toDelete = append(toDelete, rel)
-			}
-		}
-	}
-
-	return cleanedToCreate, toDelete
 }
 
-// isPubSubRelationship checks if a relationship is a Pub/Sub relationship
-func isPubSubRelationship(rel *entitiescustomv1.Relationship) bool {
-	return strings.HasPrefix(rel.Upstream.GetCustom().GetId(), "pubsub::") &&
-		strings.HasPrefix(rel.Downstream.GetCustom().GetId(), "pubsub::")
+// reconcileRelationships decides what to publish and what to withdraw.
+func reconcileRelationships(
+	desired, stored, withdrawable []*entitiescustomv1.Relationship,
+	mode relationshipMode,
+) (toCreate, toDelete []*entitiescustomv1.Relationship) {
+	switch mode {
+	case relationshipsPrune:
+		return nil, withdrawable
+	case relationshipsReconcile:
+		return missingRelationships(desired, stored), staleRelationships(desired, withdrawable)
+	case relationshipsOff:
+		return nil, nil
+	}
+	return nil, nil
+}
+
+// missingRelationships returns the desired edges the workspace does not hold yet.
+// It is checked against everything stored, not only the withdrawable subset, so
+// an edge to a BigQuery table or a bucket is not upserted again on every run.
+func missingRelationships(desired, stored []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
+	storedSet := make(map[string]struct{}, len(stored))
+	for _, rel := range stored {
+		storedSet[rel.String()] = struct{}{}
+	}
+
+	var missing []*entitiescustomv1.Relationship
+	for _, rel := range desired {
+		if _, exists := storedSet[rel.String()]; !exists {
+			missing = append(missing, rel)
+		}
+	}
+	return missing
+}
+
+// staleRelationships returns the withdrawable edges this run did not compute:
+// the subscription behind them is gone from Pub/Sub, so the edge is drift.
+//
+// It does not second-guess an empty desired set. Whether this run may withdraw
+// anything is relationshipMode's answer, and the withdrawable set is already
+// bounded by what the run scanned and what its filters accept.
+func staleRelationships(desired, withdrawable []*entitiescustomv1.Relationship) []*entitiescustomv1.Relationship {
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, rel := range desired {
+		desiredSet[rel.String()] = struct{}{}
+	}
+
+	var stale []*entitiescustomv1.Relationship
+	for _, rel := range withdrawable {
+		if _, exists := desiredSet[rel.String()]; !exists {
+			stale = append(stale, rel)
+		}
+	}
+	return stale
+}
+
+// ownedEdge takes rel apart into the topic and subscription names, and reports
+// whether this integration is its producer at all: an edge from a topic to one of
+// its own subscriptions is the only shape it publishes between two Pub/Sub
+// entities.
+//
+// A subscription's entity id is its topic's id plus the subscription name, so the
+// ownership test and the names fall out of the same two cuts. Everything else the
+// workspace holds around a topic — a service catalog linking a consumer, a
+// bucket's notification edge — belongs to another producer, and withdrawing it
+// makes every run undo their work.
+func ownedEdge(rel *entitiescustomv1.Relationship) (topic, subscription string, ok bool) {
+	topicEntity := rel.Upstream.GetCustom().GetId()
+	topic, ok = strings.CutPrefix(topicEntity, "pubsub::")
+	if !ok {
+		return "", "", false
+	}
+	subscription, ok = strings.CutPrefix(rel.Downstream.GetCustom().GetId(), topicEntity+"::")
+	if !ok {
+		return "", "", false
+	}
+	return topic, subscription, true
+}
+
+// withdrawableRelationships keeps the stored edges this run is answerable for:
+// ones it is the producer of, between a topic it scanned and a subscription its
+// configuration would have published had that subscription still existed.
+//
+// Both ends are judged by the filters rather than by whether the run inventoried
+// an entity, because the two reasons an edge has no entity behind it are
+// opposites. Excluded by configuration means the edge is not this run's to touch;
+// deleted from Pub/Sub means the edge is exactly what this run exists to
+// withdraw.
+//
+// The relationship filter is consulted for the same reason the subscription one
+// is, and because the alternative was incoherent: the desired set mixes these
+// edges with the delivery edges, so an excluded edge was withdrawn whenever an
+// unrelated BigQuery or bucket edge happened to exist, and kept when none did.
+func withdrawableRelationships(
+	rels []*entitiescustomv1.Relationship,
+	acceptedTopicIds map[string]bool,
+	subscriptionFilter Filter,
+	relationshipFilter Filter,
+) []*entitiescustomv1.Relationship {
+	var withdrawable []*entitiescustomv1.Relationship
+	for _, rel := range rels {
+		topic, subscription, ok := ownedEdge(rel)
+		if !ok || !acceptedTopicIds[topic] || !subscriptionFilter.Accept(subscription) {
+			continue
+		}
+		if !relationshipFilter.Accept(topic + "->" + subscription) {
+			continue
+		}
+		withdrawable = append(withdrawable, rel)
+	}
+	return withdrawable
 }
 
 // ============================================================================

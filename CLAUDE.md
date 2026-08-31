@@ -29,19 +29,24 @@ golines -w -m 150 .
 
 Understanding the sync flow when modifying code:
 
-1. `runSync()` (main.go:90) - Cobra command handler, sets up context and logging
-2. `syncResources()` (main.go:394) - Main orchestration
-3. `syncTopics()` (main.go:414) - Iterates topics, filters, creates entities, returns accepted topic IDs
-4. `syncSubscriptions()` (main.go:465) - Filters by accepted topics, creates entities, queues relationships
-5. `manageRelationships()` (main.go:569) - Creates/deletes with deduplication
-6. `updateEntityGroup()` (main.go:657) - Updates group for automatic cleanup
+1. `runSync()` - Cobra command handler, sets up context and logging
+2. `syncResources()` - Main orchestration
+3. `syncTopics()` - Iterates topics, filters, creates entities, returns accepted topic IDs
+4. `syncSubscriptions()` - Filters by accepted topics, creates entities, queues relationships
+5. `manageRelationships()` - Reconciles edges (see the reconciliation rules below)
+6. `updateEntityGroup()` - Updates group for automatic cleanup
 
 **Important patterns:**
 - All `must*` functions exit with `os.Exit(1)` on fatal errors (don't return errors)
 - Context cancellation checked in iterator loops via `checkCancellation()`
+- Cancellation is not a destructive path, despite the partial inventory a
+  cancelled scan returns: `manageRelationships` and `updateEntityGroup` issue
+  their gRPC calls with the same context, and gRPC fails a call on a done
+  context before the wire, so the run exits 1 instead of reconciling from what
+  it managed to scan
 - GCP iterators use `iterator.Done` pattern for completion
 
-### SYNQ Custom Entities API Patterns
+### Custom Entities API Patterns
 
 **Custom Identifiers:**
 ```go
@@ -54,22 +59,49 @@ Understanding the sync flow when modifying code:
 }
 ```
 
-**Relationship Deduplication:**
-```go
-// Use relationship.String() as map key for deduplication
-existingMap := make(map[string]struct{})
-for _, rel := range existing {
-    existingMap[rel.String()] = struct{}{}
-}
+**Relationship reconciliation — a run only withdraws what it computed.** All
+four rules exist because breaking one is silent, and one of them was broken in a
+released version: relationships are opt-in, the desired set is therefore empty by
+default, and an empty desired set used to mean "delete every stored
+topic-to-subscription edge", which wiped another integration's lineage from a
+live workspace.
 
-// Filter out relationships that already exist
-var cleanedToCreate []*entitiescustomv1.Relationship
-for _, rel := range toCreate {
-    if _, exists := existingMap[rel.String()]; !exists {
-        cleanedToCreate = append(cleanedToCreate, rel)
-    }
-}
-```
+- `relationshipModeFor` states what the run does — off, reconcile or prune — and
+  `reconcileRelationships` acts on that and nothing else. Off is the default and
+  withdraws nothing; it is the rule the released bug broke.
+- The mode is stated rather than inferred from an empty desired set, which
+  answers a different question and got this wrong twice: a plain run computes no
+  edges *and so does* a topic whose last subscription was deleted, where
+  withdrawing is the whole point. The same inference also let an unrelated
+  BigQuery edge decide whether filtered topic edges were withdrawn.
+- `ownedEdge` is the shape test: a subscription's id is its topic's id plus the
+  subscription name, so an edge to anything else touching that topic belongs to
+  another producer. The same two cuts hand back the topic and subscription names
+  the filters below are applied to.
+- `withdrawableRelationships` keeps only the edges this run is answerable for:
+  between a topic it scanned and a subscription its configuration would have
+  published. Both ends are judged by the **filters** — the subscription filter
+  and the relationship filter — not by whether an entity was inventoried, because
+  the two reasons an edge has no entity behind it are opposites: excluded by
+  configuration means leave the edge alone, deleted from Pub/Sub means withdraw
+  it. Judging by the inventory made every deleted subscription leak its edge
+  forever. Skipping the relationship filter here was worse than inconsistent: the
+  desired set mixes topic edges with the BigQuery and bucket ones, and
+  `staleRelationships` uses its emptiness as the sentinel, so an excluded topic
+  edge was withdrawn whenever an unrelated delivery edge happened to exist.
+
+`relationships_test.go` covers all four. The first test is the reproducer for
+the released bug; the pairs that pin a rule apart from its opposite are
+`TestNothingIsDeletedWhenRelationshipsAreOff` /
+`TestTheLastSubscriptionOfATopicLosesItsEdge` for the mode, and
+`TestAStaleSubscriptionEdgeIsDeleted` / `TestAFilteredSubscriptionKeepsItsEdge`
+for the filters.
+
+**Why the feature is off by default**, and why `--relationships.prune` exists:
+linking a topic to its subscriptions closes a cycle for every service that
+consumes a topic it also publishes, so the catalog becomes hard to follow. Prune
+is an explicit instruction to withdraw what this integration published and create
+nothing, and it is still held to `ownedEdge` and `withdrawableRelationships`.
 
 ### Resource Filtering Implementation
 
@@ -91,27 +123,50 @@ type Filter interface {
 
 ### Testing Patterns
 
-Uses testify/suite:
-```go
-type FilterSuite struct {
-    suite.Suite
-}
+`filter_test.go` uses testify/suite; everything written since uses plain
+`func TestX(t *testing.T)` with `assert`/`require`. Prefer the plain form: one
+named test per rule, its comment saying which rule and why it exists.
 
-func TestFilterSuite(t *testing.T) {
-    suite.Run(t, new(FilterSuite))
-}
+**Testing a flag** needs its own flag set. `LoadConfig` reads the global
+`pflag.CommandLine`, so swap in a fresh `pflag.NewFlagSet`, call `InitFlags()`,
+then `Parse` the args — `withFlags` in `config/config_test.go`.
 
-func (s *FilterSuite) TestFilter() {
-    s.Require().NoError(err)
-    s.True(condition)
-}
-```
+**Testing the deployment or the GCP project** means clearing the environment
+first, or the result depends on whose machine runs it: `clearDeploymentEnv`
+(`QUALITY_REGION`, `QUALITY_HOME`, …) and `noGCPProject` (`GCP_PROJECT_ID`,
+`CLOUDSDK_CONFIG`, and an empty `PATH` so gcloud is unreachable), both in
+`auth_test.go`.
+
+### Authentication
+
+`auth.go` owns it. Credentials and the deployment come from
+`github.com/getsynq/quality-oauth-go`, the same library every Coalesce Quality
+CLI uses, so the credential store is shared and `--region` resolves identically
+everywhere.
+
+- Read environment variables through `qualityoauth.Getenv`, never `os.Getenv`, or
+  that one setting stops honouring its `SYNQ_`-prefixed alias.
+- Precedence is the library's, not this repo's: `Sources.Resolve` decides, and
+  `auth_test.go` pins the tiers so a local change cannot quietly diverge. A tier
+  never vetoes a higher one: an unusable `quality.region` is an error only when
+  no flag supplied a deployment, and `LoadConfig` returns what it read alongside
+  a validation error so `auth login --region` keeps working on a machine with no
+  GCP project.
+- `oauth_url` must be HTTPS, loopback aside. It overrides the token endpoint for
+  whichever credentials the run resolved, the environment's included, so a config
+  file naming a plain-HTTP host is a credential-exfiltration primitive.
+- `App.FirstPartyClientID` stays empty. The authorization server seeds a client
+  row per released first-party CLI and this is not one; an id it does not know is
+  rejected at the authorize endpoint and the login then waits for a callback that
+  never arrives.
+- The `synq:` config section and the `--synq.*` flags are permanent aliases,
+  merged in `config.QualityConfig.merge` as the lower-precedence source.
 
 ## Key Implementation Details
 
 - Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`
 - Entity groups enable automatic cleanup via API's automatic deletion of entities not in new group
-- Relationships only managed for `pubsub::` prefixed entities (avoids touching other integrations)
+- Relationships are only withdrawn for topic-to-subscription edges this run is configured to manage (see above)
 - Icons validated as valid SVG XML before use
 - Version info injected via ldflags: `version`, `commit`, `date`
 - Context cancellation propagates to all operations for graceful shutdown
@@ -124,21 +179,21 @@ The integration creates relationships to external platforms when subscriptions h
 - Triggered when `subscription.BigQueryConfig.Table` is set
 - Creates relationship to BigQuery table using `BigqueryTableIdentifier`
 - Table format: `project:dataset.table` or `project.dataset.table`
-- Requires native BigQuery integration in SYNQ
-- **Behavior**: Links to non-existent tables are **silently ignored** by SYNQ
+- Requires a native BigQuery integration in Coalesce Quality
+- **Behavior**: Links to non-existent tables are **silently ignored**
 
 **Cloud Storage Lineage:**
 - Triggered when `subscription.CloudStorageConfig.Bucket` is set
 - Creates relationship using custom identifier: `gcs::<bucket_name>`
 - Requires GCS integration (https://github.com/getsynq/synq-google-cloud-storage)
-- **Behavior**: Links to non-existent `gcs::*` entities **WILL FAIL** the sync operation
+- **Behavior**: Links to absent `gcs::*` entities are skipped with a debug log
 
-**IMPORTANT - Excluding Cloud Storage relationships:**
-If GCS integration isn't set up, you MUST exclude GCS relationships to prevent sync failures:
+**Excluding Cloud Storage relationships** is optional — a link to an absent
+`gcs::*` entity is skipped with a debug log rather than failing the sync:
 ```yaml
 relationships:
   filter:
     exclude:
-      - '->gcs-.*'  # REQUIRED if Cloud Storage integration not configured
-      - '->bq-.*'   # Optional (BigQuery links are silently ignored)
+      - '->gcs-.*'
+      - '->bq-.*'
 ```

@@ -1,12 +1,12 @@
-# SYNQ Google Cloud Pub/Sub Integration
+# Coalesce Quality Google Cloud Pub/Sub Integration
 
-Automatically import and track your Google Cloud Pub/Sub topics and subscriptions in the SYNQ data catalog platform.
+Automatically import and track your Google Cloud Pub/Sub topics and subscriptions in the Coalesce Quality data catalog.
 
 ## What It Does
 
 This integration:
 - Discovers all Pub/Sub topics and subscriptions in your GCP project
-- Creates and maintains entities in SYNQ for visibility and governance
+- Creates and maintains entities in Coalesce Quality for visibility and governance
 - Tracks relationships between topics and subscriptions
 - Creates cross-platform lineage to BigQuery tables and Cloud Storage buckets
 - Automatically cleans up removed resources
@@ -62,21 +62,57 @@ go build
 
 ## Configuration
 
-The application works with sensible defaults and minimal configuration. Only SYNQ API credentials are required.
+The application works with sensible defaults and minimal configuration. All it needs is a credential and a GCP project.
 
-### Required: Environment Variables (.env)
+### Authentication
 
-Create a `.env` file in the project root with your SYNQ API credentials:
+There are three ways to authenticate, and they resolve in this order — the
+unattended ones win, so a scheduled sync never picks up a developer's browser
+session:
+
+**1. Client credentials.** For CI and scheduled runs. In the environment or in a
+`.env` file in the project root:
 
 ```bash
-SYNQ_CLIENT_ID=your_client_id_here
-SYNQ_CLIENT_SECRET=your_client_secret_here
-
-# GCP Project ID (optional if running on GCP or using gcloud)
-GCP_PROJECT_ID=your-gcp-project-id
+QUALITY_CLIENT_ID=your_client_id_here
+QUALITY_CLIENT_SECRET=your_client_secret_here
 ```
 
+**2. A pre-issued access token**, as `QUALITY_TOKEN`.
+
+**3. A browser login.** For running it by hand:
+
+```bash
+synq-google-cloud-pubsub auth login          # opens a browser
+synq-google-cloud-pubsub auth status         # what is stored, and for which deployment
+synq-google-cloud-pubsub auth logout
+```
+
+The credential is cached under `~/.synq/oauth/`, partitioned by deployment, and
+**shared with the other Coalesce Quality tools** — so a login done by `synqctl`
+or `synq-recon` already serves this integration, and the other way round.
+
+Publishing entities needs `SCOPE_ENTITY_EDIT`, `SCOPE_ENTITY_TYPE_EDIT` and
+`SCOPE_LINEAGE_EDIT`, which reach a personal token through the Admin role and
+above. An account without them can still run `--dry-run`; `auth status` says
+which of your stored credentials can publish.
+
+The `SYNQ_`-prefixed spelling of every variable above is still read, so existing
+`.env` files and CI configuration keep working.
+
 See `.env.example` for a template.
+
+### Choosing a deployment
+
+```bash
+synq-google-cloud-pubsub --region us          # eu (default), us or au
+synq-google-cloud-pubsub --endpoint host:443  # a self-hosted deployment
+```
+
+Resolved highest first: `--endpoint`, `--region`, the config file, then
+`QUALITY_API_ENDPOINT` / `QUALITY_REGION`, then the deployment you last logged
+into, then the EU region. So logging into a single region once is enough; you
+never type `--region` again.
 
 **Note:** The GCP project ID can be auto-detected from (in order of precedence):
 1. `GCP_PROJECT_ID` environment variable
@@ -95,12 +131,15 @@ The application works with defaults out of the box. For customization, create a 
 **Configuration precedence:** defaults → config.yaml → environment variables
 
 ```yaml
-# SYNQ API Configuration (optional, defaults shown for EU region)
-synq:
-  endpoint: "developer.synq.io:443"  # EU region (default)
-  # For US region, use: "api.us.synq.io:443"
-  oauth_url: "https://developer.synq.io/oauth2/token"  # EU region (default)
-  # For US region, use: "https://api.us.synq.io/oauth2/token"
+# Coalesce Quality configuration (all optional)
+quality:
+  # region: "us"                      # eu (default), us or au
+  # endpoint: "api.us.synq.io:443"    # overrides region
+  # client_id: ""                     # prefer QUALITY_CLIENT_ID
+  # client_secret: ""                 # prefer QUALITY_CLIENT_SECRET
+  # token: ""                         # a pre-issued access token
+# The `synq:` section this replaced is still read, and fills in anything
+# `quality:` leaves unset.
 
 # GCP Configuration (optional, defaults shown)
 gcp:
@@ -108,7 +147,7 @@ gcp:
   # project_id can also be set here instead of GCP_PROJECT_ID env var
   # entity_group_id: "pubsub::custom-group-id"  # defaults to pubsub::<project_id>
 
-# Custom Entity Type IDs (optional, defaults shown)
+# Custom entity type IDs (optional, defaults shown)
 types:
   topic_type_id: 20
   subscription_type_id: 21
@@ -146,12 +185,12 @@ The integration automatically creates lineage relationships when subscriptions d
 - **Cloud Storage buckets** (via `CloudStorageConfig`) - creates relationships to custom GCS bucket entities
 
 **Requirements:**
-- **BigQuery lineage**: Native BigQuery integration in SYNQ. Links to non-existent tables are created anyway (safe).
+- **BigQuery lineage**: a native BigQuery integration in Coalesce Quality. Links to non-existent tables are created anyway (safe).
 - **Cloud Storage lineage**: [GCS integration](https://github.com/getsynq/synq-google-cloud-storage) should be set up first. Links to non-existent `gcs::<bucket_name>` entities are skipped with debug logging.
 
 **Behavior:**
 - **BigQuery relationships**: Always created (non-custom entities are safe to link)
-- **GCS relationships**: Only created if the `gcs::<bucket_name>` entity exists in SYNQ
+- **GCS relationships**: Only created if the `gcs::<bucket_name>` entity exists in Coalesce Quality
   - If GCS bucket entity doesn't exist, relationship is skipped with a debug log message
   - No sync failures - relationships are created opportunistically
 
@@ -172,8 +211,7 @@ relationships:
 ```
 
 **Defaults:**
-- SYNQ endpoint: `developer.synq.io:443` (EU region - for US region use `api.us.synq.io:443`)
-- OAuth URL: `https://developer.synq.io/oauth2/token` (EU region - for US region use `https://api.us.synq.io/oauth2/token`)
+- Deployment: the EU region, or the one you last logged into. `--region us` / `--region au` select the others, and every OAuth endpoint is discovered from the deployment itself.
 - Type IDs: Topic=20, Subscription=21
 - User agent: `synq-pubsub-client-v1.0.0`
 - Entity group ID: `pubsub::<project_id>` (for automatic cleanup of removed resources)
@@ -209,11 +247,11 @@ LOG_LEVEL=WARN go run main.go
 
 ## Network Requirements
 
-If your GCP project has firewall rules that restrict inbound connections, you may need to whitelist SYNQ's egress IP addresses to allow the integration to access your Pub/Sub resources.
+If your GCP project has firewall rules that restrict inbound connections, you may need to whitelist the Coalesce Quality egress IP addresses to allow the integration to access your Pub/Sub resources.
 
-### SYNQ Egress IP Addresses
+### Egress IP addresses
 
-Whitelist the following IP addresses based on your SYNQ deployment region:
+Whitelist the following IP addresses based on your deployment region:
 
 **EU Region (Default)**
 - App: https://app.synq.io
@@ -225,7 +263,7 @@ Whitelist the following IP addresses based on your SYNQ deployment region:
 - API: https://api.us.synq.io
 - **Egress IP: `35.238.250.82`**
 
-For the latest IP addresses, see the [SYNQ Security Documentation](https://docs.synq.io/security/ip#ip-addresses-by-region).
+For the latest IP addresses, see the [security documentation](https://docs.synq.io/security/ip#ip-addresses-by-region).
 
 ## Running
 
@@ -258,10 +296,12 @@ All configuration options are available as command-line flags. Flags have the hi
 **Common flags:**
 - `-c, --config` - Path to config file (default: `config.yaml`)
 - `-h, --help` - Show help message
-- `--dry-run` - Dry-run mode: scan GCP resources but don't call SYNQ API
+- `--dry-run` - Dry-run mode: scan GCP resources but don't call the Coalesce Quality API
 - `--gcp.project-id` - GCP project ID (auto-detected if not set)
-- `--synq.client-id` - SYNQ API client ID (or use SYNQ_CLIENT_ID env var)
-- `--synq.client-secret` - SYNQ API client secret (or use SYNQ_CLIENT_SECRET env var)
+- `--client-id` - client credential id (or `QUALITY_CLIENT_ID`)
+- `--client-secret` - client credential secret (or `QUALITY_CLIENT_SECRET`)
+- `--region` - deployment: `eu`, `us` or `au`
+- `--endpoint` - API endpoint, overriding `--region`
 
 **Filter flags:**
 - `--filter.topics.include` - Topic name patterns to include
@@ -271,29 +311,29 @@ All configuration options are available as command-line flags. Flags have the hi
 
 **Relationship flags:**
 - `--relationships.enabled` - Enable topic->subscription relationships (default: false)
+- `--relationships.prune` - Withdraw the topic->subscription relationships this integration published, and create none
 - `--relationships.filter.include` - Relationship patterns to include
 - `--relationships.filter.exclude` - Relationship patterns to exclude
 
 **Type configuration flags:**
-- `--types.topic-type-id` - SYNQ entity type ID for topics (default: 20)
-- `--types.subscription-type-id` - SYNQ entity type ID for subscriptions (default: 21)
+- `--types.topic-type-id` - custom entity type ID for topics (default: 20)
+- `--types.subscription-type-id` - custom entity type ID for subscriptions (default: 21)
 - `--types.topic-icon` - Path to custom topic icon SVG
 - `--types.subscription-icon` - Path to custom subscription icon SVG
 
 **Advanced flags:**
 - `--gcp.entity-group-id` - Entity group ID (defaults to `pubsub::<project_id>`)
 - `--gcp.user-agent` - User agent for GCP API calls
-- `--synq.endpoint` - SYNQ API endpoint (EU: `developer.synq.io:443`, US: `api.us.synq.io:443`)
-- `--synq.oauth-url` - SYNQ OAuth2 token URL (EU: `https://developer.synq.io/oauth2/token`, US: `https://api.us.synq.io/oauth2/token`)
+- `--synq.endpoint`, `--synq.client-id`, `--synq.client-secret`, `--synq.oauth-url` - the names these replaced. Still accepted, hidden from `--help`.
 
 Run `go run main.go --help` to see all available flags.
 
 ### Dry-Run Mode
 
-Use `--dry-run` to scan GCP Pub/Sub resources without making any changes to SYNQ:
+Use `--dry-run` to scan GCP Pub/Sub resources without publishing anything:
 
 ```bash
-# Dry-run mode (no SYNQ API calls)
+# Dry-run mode (no API calls)
 go run main.go --dry-run
 
 # Dry-run with debug logging to see what would be created
@@ -304,9 +344,9 @@ In dry-run mode:
 - ✅ Scans GCP Pub/Sub topics and subscriptions
 - ✅ Applies filters
 - ✅ Shows what entities would be created
-- ❌ Does not call SYNQ API
+- ❌ Does not call the Coalesce Quality API
 - ❌ Does not create/update entities or relationships
-- ❌ Does not require SYNQ credentials
+- ❌ Does not require credentials
 
 ### Examples
 
@@ -314,8 +354,8 @@ In dry-run mode:
 # Run with custom project ID
 go run main.go --gcp.project-id=my-project
 
-# Run with US region endpoints
-go run main.go --synq.endpoint=api.us.synq.io:443 --synq.oauth-url=https://api.us.synq.io/oauth2/token
+# Run against the US region
+go run main.go --region=us
 
 # Run with relationships enabled and custom filters
 go run main.go --relationships.enabled --filter.topics.exclude="test-.*"
@@ -332,10 +372,10 @@ go run main.go --types.topic-type-id=100 --types.subscription-type-id=101
 
 ## How It Works
 
-1. Authenticates with SYNQ API using OAuth2 client credentials
+1. Authenticates against the Coalesce Quality API (browser login, client credentials or a pre-issued token)
 2. Creates/updates custom entity types (Topic and Subscription)
 3. Iterates through GCP Pub/Sub topics and subscriptions
-4. Creates entities in SYNQ for each resource
+4. Creates an entity for each resource
 5. Manages relationships between topics and subscriptions
 6. Uses entity groups to track resources by project (enables automatic cleanup)
 
@@ -345,7 +385,7 @@ The integration consists of three main components:
 
 **main.go** - Main application entry point:
 - Configuration management using viper (supports config file, env vars, and CLI flags)
-- Client setup (SYNQ gRPC with OAuth2, GCP Pub/Sub)
+- Client setup (Coalesce Quality gRPC, GCP Pub/Sub)
 - Resource synchronization orchestration
 - Graceful shutdown handling
 
@@ -361,9 +401,24 @@ The integration consists of three main components:
 
 ### Key Features
 
-**Entity Groups:** The integration uses entity groups to track all entities created in each run. When the group is updated, SYNQ automatically removes entities that were in the previous group but not in the current one, enabling automatic cleanup of deleted resources.
+**Entity Groups:** The integration uses entity groups to track all entities created in each run. When the group is updated, Coalesce Quality automatically removes entities that were in the previous group but not in the current one, enabling automatic cleanup of deleted resources.
 
-**Relationship Management:** When enabled, the integration creates relationships between topics and their subscriptions. The system deduplicates relationships to avoid recreating existing ones and cleans up relationships that no longer exist.
+**Relationship Management:** When enabled, the integration creates relationships between topics and their subscriptions, and withdraws the ones that no longer exist.
+
+**Relationships are off by default on purpose.** Linking a topic to its
+subscriptions closes a cycle for every service that consumes a topic it also
+publishes, and a catalog full of two-hop cycles is harder to follow than one
+where the publishing and consuming sides are separate. `--relationships.prune`
+is the way back if a workspace turned them on: it withdraws the edges this
+integration published and creates none.
+
+A run only ever withdraws relationships **it computed itself**:
+
+- Relationships are off by default, and a run with them off withdraws none. With them on, a topic whose last subscription was deleted does lose that edge: reconciling is what the feature is for.
+- Only an edge from a topic to one of *its own* subscriptions belongs to this integration. A service catalog's edge into a topic, or a bucket's notification edge, is another producer's and is left alone.
+- Only edges between a topic this run scanned and a subscription its filters accept are judged, so a subscription excluded by a filter — or a relationship excluded by `relationships.filter` — keeps its lineage instead of reading as removed. A subscription that is simply gone from Pub/Sub still has its edge withdrawn: that is the reconciliation the feature is for.
+
+**Cycles:** each integration only withdraws the relationship shape it publishes, so the two never undo each other. With both relationship features enabled, a bucket that notifies a topic whose subscription writes back to that same bucket forms a three-hop cycle in the graph. That is a faithful picture of the delivery path rather than a fault, but it is worth knowing before you read it as one.
 
 **Custom Identifiers:** All entities use custom identifiers with `pubsub::` prefix for namespace isolation. Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`.
 
@@ -386,9 +441,9 @@ go test -v -cover ./...
 
 Key dependencies used by this project:
 
-- `buf.build/gen/go/getsynq/api` - SYNQ API protocol buffers (gRPC and protobuf)
+- `buf.build/gen/go/getsynq/api` - Coalesce Quality API protocol buffers (gRPC and protobuf)
 - `cloud.google.com/go/pubsub` - Google Cloud Pub/Sub client
-- `golang.org/x/oauth2/clientcredentials` - OAuth2 client credentials flow
+- `github.com/getsynq/quality-oauth-go` - the shared browser login and credential store
 - `github.com/spf13/cobra` - CLI framework
 - `github.com/spf13/viper` - Configuration management
 - `github.com/stretchr/testify` - Testing framework with suite support
