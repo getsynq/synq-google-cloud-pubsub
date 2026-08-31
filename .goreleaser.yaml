@@ -92,7 +92,7 @@ release:
   mode: replace
   name_template: "v{{.Version}}"
   header: |
-    ## Google Cloud Pub/Sub Integration for SYNQ
+    ## Google Cloud Pub/Sub Integration for Coalesce Quality
 
     Release v{{ .Version }}
   footer: |
