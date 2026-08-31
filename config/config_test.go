@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -107,4 +108,59 @@ func TestProjectIDIsStillRequired(t *testing.T) {
 	_, err := LoadConfig(writeConfig(t, "quality:\n  region: eu\n"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GCP project ID is required")
+}
+
+// withFlags gives the test its own flag set, registered the way main does, and
+// parses args into it. LoadConfig reads pflag.CommandLine directly, so a test
+// that wants to exercise a flag has to stand one up.
+func withFlags(t *testing.T, args ...string) {
+	t.Helper()
+	saved := pflag.CommandLine
+	pflag.CommandLine = pflag.NewFlagSet(t.Name(), pflag.ContinueOnError)
+	t.Cleanup(func() { pflag.CommandLine = saved })
+	InitFlags()
+	require.NoError(t, pflag.CommandLine.Parse(args))
+}
+
+// TestDeprecatedCredentialFlagsAreStillRead is the compatibility case for the
+// flags existing CI passes. They are accepted and hidden rather than removed,
+// which is only worth anything if the value they carry actually arrives: viper
+// keys the flag as `synq.client-id` while the field wants `synq.client_id`, so
+// the value went nowhere and the run failed to authenticate.
+func TestDeprecatedCredentialFlagsAreStillRead(t *testing.T) {
+	withFlags(t, "--synq.client-id=legacy-id", "--synq.client-secret=legacy-secret")
+
+	cfg, err := LoadConfig(writeConfig(t, "gcp:\n  project_id: example-project\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-id", cfg.Quality.ClientID)
+	assert.Equal(t, "legacy-secret", cfg.Quality.ClientSecret)
+}
+
+// TestPromotedCredentialFlagsWinOverDeprecated pins which way round the pair
+// resolves when a script passes both.
+func TestPromotedCredentialFlagsWinOverDeprecated(t *testing.T) {
+	withFlags(t,
+		"--client-id=promoted-id", "--synq.client-id=legacy-id",
+		"--client-secret=promoted-secret", "--synq.client-secret=legacy-secret",
+	)
+
+	cfg, err := LoadConfig(writeConfig(t, "gcp:\n  project_id: example-project\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "promoted-id", cfg.Quality.ClientID)
+	assert.Equal(t, "promoted-secret", cfg.Quality.ClientSecret)
+}
+
+// TestDeprecatedEndpointFlagOutranksTheConfigFile keeps the tier the flag sits
+// in: what the user typed beats what the file holds, deprecated spelling or not.
+func TestDeprecatedEndpointFlagOutranksTheConfigFile(t *testing.T) {
+	withFlags(t, "--synq.endpoint=typed.synq.io:443")
+
+	cfg, err := LoadConfig(writeConfig(t, `
+gcp:
+  project_id: example-project
+quality:
+  endpoint: from-file.synq.io:443
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "typed.synq.io:443", cfg.Quality.EndpointFlag)
 }
