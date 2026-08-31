@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	entitiescustomv1grpc "buf.build/gen/go/getsynq/api/grpc/go/synq/entities/custom/v1/customv1grpc"
 	entitiescustomv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/custom/v1"
@@ -94,13 +95,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		ctx = context.Background()
 	}
 
-	// Setup context with cancellation and signal handling
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// SIGTERM is here because a scheduled run in a container is asked to stop
+	// that way, and os.Interrupt alone left those runs with no cancellation path.
+	// The scan loops report the cancellation themselves, through
+	// checkCancellation, so there is nothing to watch the context for here.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Setup logging and handle graceful shutdown
 	setupLogging(ctx)
-	handleShutdown(ctx, cancel)
 
 	logger := slog.Default()
 	logger.InfoContext(ctx, "Starting Google Cloud Pub/Sub integration")
@@ -199,18 +201,6 @@ type syncStats struct {
 // ============================================================================
 // Configuration and Setup
 // ============================================================================
-
-// handleShutdown sets up graceful shutdown on interrupt signal
-func handleShutdown(ctx context.Context, cancel context.CancelFunc) {
-	logger := slog.Default()
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt)
-		<-sigChan
-		logger.InfoContext(ctx, "Received interrupt signal, shutting down...")
-		cancel()
-	}()
-}
 
 // buildFilters creates all filters from configuration
 func buildFilters(cfg *config.Config) *filters {
