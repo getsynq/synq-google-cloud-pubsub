@@ -1,10 +1,13 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	qualityoauth "github.com/getsynq/quality-oauth-go"
 	"github.com/getsynq/synq-google-cloud-pubsub/config"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,4 +109,88 @@ func TestDeclaredScopesCoverWhatASyncWrites(t *testing.T) {
 func TestTheAppRegistersDynamically(t *testing.T) {
 	assert.Empty(t, authApp().FirstPartyClientID)
 	assert.Equal(t, toolName, authApp().SoftwareID)
+}
+
+// writeConfigFile puts a config file somewhere a subcommand can be pointed at.
+func writeConfigFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	return path
+}
+
+// noGCPProject puts the process where someone logging in for the first time is:
+// nothing in the environment names a project, and there is no gcloud to ask.
+func noGCPProject(t *testing.T) {
+	t.Helper()
+	t.Setenv("GCP_PROJECT_ID", "")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "")
+	t.Setenv("GCLOUD_PROJECT", "")
+	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
+	t.Setenv("PATH", "")
+}
+
+// TestAnUnknownRegionInTheConfigFileDoesNotBlockAFlag is the reproducer for a
+// lower tier vetoing a higher one. A typo in the file made --region unusable,
+// which is backwards: the flag is the tier that exists to override the file.
+func TestAnUnknownRegionInTheConfigFileDoesNotBlockAFlag(t *testing.T) {
+	clearDeploymentEnv(t)
+
+	target, err := resolveTarget(&config.Config{Quality: config.QualityConfig{
+		Region:     "atlantis",
+		RegionFlag: "us",
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "us", target.Region)
+
+	target, err = resolveTarget(&config.Config{Quality: config.QualityConfig{
+		Region:       "atlantis",
+		EndpointFlag: "api.us.synq.io:443",
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "api.us.synq.io:443", target.Endpoint)
+}
+
+// TestAuthKeepsTheDeploymentWhenTheGCPProjectIsMissing is the reproducer for
+// `auth login --region us` logging in somewhere else.
+//
+// A sync needs a GCP project and logging in does not, but both read the same
+// configuration, so the missing project failed the load and the deployment went
+// down with it — flags, config file and all — leaving the default region.
+func TestAuthKeepsTheDeploymentWhenTheGCPProjectIsMissing(t *testing.T) {
+	clearDeploymentEnv(t)
+	noGCPProject(t)
+
+	cmd := &cobra.Command{}
+	cmd.Flags().String("config", writeConfigFile(t, "quality:\n  region: us\n"), "")
+
+	target, err := targetFromCommand(cmd)
+	require.NoError(t, err)
+	assert.Equal(t, "us", target.Region)
+}
+
+// TestAnOAuthURLMustBeHTTPS keeps a config file from pointing credentials at a
+// server of its choosing. The override exists for a self-hosted authorization
+// server, and it is applied to credentials that came from the environment, so a
+// config file that names a plain-HTTP host is a way to read them off the wire.
+func TestAnOAuthURLMustBeHTTPS(t *testing.T) {
+	derived := "https://developer.synq.io/oauth2/token"
+
+	url, err := tokenURL(derived, "")
+	require.NoError(t, err)
+	assert.Equal(t, derived, url)
+
+	url, err = tokenURL(derived, "https://auth.self-hosted.example/oauth2/token")
+	require.NoError(t, err)
+	assert.Equal(t, "https://auth.self-hosted.example/oauth2/token", url)
+
+	_, err = tokenURL(derived, "http://evil.example/oauth2/token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "https")
+
+	// Developing against an authorization server on the loopback interface is
+	// the one case plain HTTP is not a downgrade.
+	url, err = tokenURL(derived, "http://localhost:8080/oauth2/token")
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:8080/oauth2/token", url)
 }

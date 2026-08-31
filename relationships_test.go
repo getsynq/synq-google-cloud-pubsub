@@ -45,10 +45,23 @@ func excluding(t *testing.T, pattern string) Filter {
 func reconcile(
 	desired, stored []*entitiescustomv1.Relationship,
 	acceptedTopicIds map[string]bool,
-	subscriptionFilter Filter,
+	subscriptionFilter, relationshipFilter Filter,
 ) (toCreate, toDelete []*entitiescustomv1.Relationship) {
-	withdrawable := withdrawableRelationships(stored, acceptedTopicIds, subscriptionFilter)
+	withdrawable := withdrawableRelationships(stored, acceptedTopicIds, subscriptionFilter, relationshipFilter)
 	return missingRelationships(desired, stored), staleRelationships(desired, withdrawable)
+}
+
+// bigQueryEdge is a delivery relationship, the shape this tool publishes to an
+// entity it does not own.
+func bigQueryEdge(subscription string) *entitiescustomv1.Relationship {
+	return &entitiescustomv1.Relationship{
+		Upstream: customID(subscription),
+		Downstream: &entitiesv1.Identifier{
+			Id: &entitiesv1.Identifier_BigqueryTable{
+				BigqueryTable: &entitiesv1.BigqueryTableIdentifier{Project: "p", Dataset: "d", Table: "t"},
+			},
+		},
+	}
 }
 
 // TestNothingIsDeletedWhenTheRunComputedNothing is the reproducer for a sync
@@ -63,7 +76,7 @@ func TestNothingIsDeletedWhenTheRunComputedNothing(t *testing.T) {
 		edge("pubsub::prod.gcs.artefacts", "pubsub::prod.gcs.artefacts::prod.gcs.artefacts.consumer.subscription"),
 	}
 
-	_, toDelete := reconcile(nil, stored, map[string]bool{"prod.gcs.artefacts": true}, acceptAll())
+	_, toDelete := reconcile(nil, stored, map[string]bool{"prod.gcs.artefacts": true}, acceptAll(), acceptAll())
 
 	assert.Empty(t, edgeKeys(toDelete), "a run that computed no relationships must not delete any")
 }
@@ -85,7 +98,7 @@ func TestAStaleSubscriptionEdgeIsDeleted(t *testing.T) {
 		edge("pubsub::topic", "pubsub::topic::topic.retired.subscription"),
 	}
 
-	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll())
+	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll(), acceptAll())
 
 	assert.Empty(t, toCreate, "an edge that already exists is not created again")
 	assert.Equal(t, []string{"pubsub::topic->pubsub::topic::topic.retired.subscription"}, edgeKeys(toDelete))
@@ -108,7 +121,7 @@ func TestAnotherProducersEdgeSurvives(t *testing.T) {
 		edge("pubsub::topic", "pubsub::other::other.sub.subscription"),
 	}
 
-	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true, "other": true}, acceptAll())
+	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true, "other": true}, acceptAll(), acceptAll())
 
 	assert.Empty(t, edgeKeys(toDelete))
 }
@@ -145,7 +158,7 @@ func TestAFilteredSubscriptionKeepsItsEdge(t *testing.T) {
 		edge("pubsub::topic", "pubsub::topic::topic.excluded.subscription"),
 	}
 
-	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`))
+	_, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`), acceptAll())
 
 	assert.Empty(t, edgeKeys(toDelete))
 }
@@ -158,7 +171,7 @@ func TestATopicThisRunNeverScannedKeepsItsEdges(t *testing.T) {
 		edge("pubsub::unscanned", "pubsub::unscanned::unscanned.sub.subscription"),
 	}
 
-	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, acceptAll())
+	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, acceptAll(), acceptAll())
 
 	assert.Empty(t, edgeKeys(withdrawable))
 }
@@ -177,7 +190,7 @@ func TestPruneWithdrawsOnlyWhatThisToolPublished(t *testing.T) {
 	}
 
 	// Prune deletes exactly the withdrawable set, computing nothing.
-	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`))
+	withdrawable := withdrawableRelationships(stored, map[string]bool{"topic": true}, excluding(t, `\.excluded\.`), acceptAll())
 
 	assert.Equal(t, []string{
 		"pubsub::topic->pubsub::topic::topic.live.subscription",
@@ -190,19 +203,40 @@ func TestPruneWithdrawsOnlyWhatThisToolPublished(t *testing.T) {
 // from the withdrawable set; checking the creates against that set instead of
 // against everything stored would republish it on every run.
 func TestAnExistingCrossPlatformEdgeIsNotUpsertedAgain(t *testing.T) {
-	bq := &entitiescustomv1.Relationship{
-		Upstream: customID("pubsub::topic::topic.live.subscription"),
-		Downstream: &entitiesv1.Identifier{
-			Id: &entitiesv1.Identifier_BigqueryTable{
-				BigqueryTable: &entitiesv1.BigqueryTableIdentifier{Project: "p", Dataset: "d", Table: "t"},
-			},
-		},
-	}
+	bq := bigQueryEdge("pubsub::topic::topic.live.subscription")
 	desired := []*entitiescustomv1.Relationship{bq}
 	stored := []*entitiescustomv1.Relationship{bq}
 
-	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll())
+	toCreate, toDelete := reconcile(desired, stored, map[string]bool{"topic": true}, acceptAll(), acceptAll())
 
 	assert.Empty(t, toCreate)
 	assert.Empty(t, toDelete)
+}
+
+// TestAnExcludedRelationshipKeepsItsEdge is the reproducer for a filter that
+// deleted the very edges it was written to leave out.
+//
+// The desired set mixes topic edges with the BigQuery and Cloud Storage delivery
+// edges, and staleRelationships used its emptiness as the safety sentinel. A
+// relationship filter that excluded the topic edges therefore withdrew every
+// stored one as soon as a single delivery edge existed to make the set non-empty,
+// and withdrew nothing when none did. Same configuration, opposite outcome,
+// decided by unrelated data.
+func TestAnExcludedRelationshipKeepsItsEdge(t *testing.T) {
+	desired := []*entitiescustomv1.Relationship{
+		bigQueryEdge("pubsub::topic::topic.live.subscription"),
+	}
+	stored := []*entitiescustomv1.Relationship{
+		edge("pubsub::topic", "pubsub::topic::topic.live.subscription"),
+		bigQueryEdge("pubsub::topic::topic.live.subscription"),
+	}
+
+	_, toDelete := reconcile(
+		desired, stored,
+		map[string]bool{"topic": true},
+		acceptAll(),
+		excluding(t, `->.*\.subscription$`),
+	)
+
+	assert.Empty(t, edgeKeys(toDelete), "an edge the relationship filter excludes is not this run's to withdraw")
 }

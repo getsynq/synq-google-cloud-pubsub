@@ -422,7 +422,16 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 		}
 	}
 
-	subscriptionCount, relationshipsToCreate := syncSubscriptions(ctx, cfg, pubsubClient, entitiesClient, filters, acceptedTopics, &createdEntities, customEntities)
+	subscriptionCount, relationshipsToCreate := syncSubscriptions(
+		ctx,
+		cfg,
+		pubsubClient,
+		entitiesClient,
+		filters,
+		acceptedTopics,
+		&createdEntities,
+		customEntities,
+	)
 
 	// Manage relationships and entity groups only if not in dry-run mode
 	if clients != nil {
@@ -434,6 +443,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 				relationshipsToCreate,
 				acceptedTopics,
 				filters.subscriptions,
+				filters.relationships,
 				cfg.Relationships.Prune,
 			)
 		}
@@ -707,6 +717,7 @@ func manageRelationships(
 	relationshipsToCreate []*entitiescustomv1.Relationship,
 	acceptedTopicIds map[string]bool,
 	subscriptionFilter Filter,
+	relationshipFilter Filter,
 	prune bool,
 ) {
 	logger := slog.Default()
@@ -720,7 +731,7 @@ func manageRelationships(
 		os.Exit(1)
 	}
 
-	withdrawable := withdrawableRelationships(listResp.Relationships, acceptedTopicIds, subscriptionFilter)
+	withdrawable := withdrawableRelationships(listResp.Relationships, acceptedTopicIds, subscriptionFilter, relationshipFilter)
 
 	var toCreate, toDelete []*entitiescustomv1.Relationship
 	if prune {
@@ -837,7 +848,9 @@ func withdrawableRelationships(
 	rels []*entitiescustomv1.Relationship,
 	acceptedTopicIds map[string]bool,
 	subscriptionFilter Filter,
+	relationshipFilter Filter,
 ) []*entitiescustomv1.Relationship {
+	_ = relationshipFilter
 	var withdrawable []*entitiescustomv1.Relationship
 	for _, rel := range rels {
 		topic, subscription, ok := ownedEdge(rel)

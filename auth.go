@@ -139,19 +139,27 @@ func dialClientCredentials(
 	target qualityoauth.Target,
 	clientID, clientSecret string,
 ) (*grpc.ClientConn, error) {
-	// The token URL is derived from the deployment. A config file that spells one
-	// out explicitly still wins, because a self-hosted deployment can serve the
-	// authorization server from somewhere other than the API host.
-	tokenURL := qualityoauth.OAuthTokenURL(target)
-	if cfg.Quality.OAuthURL != "" {
-		tokenURL = cfg.Quality.OAuthURL
+	url, err := tokenURL(qualityoauth.OAuthTokenURL(target), cfg.Quality.OAuthURL)
+	if err != nil {
+		return nil, err
 	}
 	oauthConfig := &clientcredentials.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		TokenURL:     tokenURL,
+		TokenURL:     url,
 	}
 	return dial(target, grpc.WithPerRPCCredentials(oauth.TokenSource{TokenSource: oauthConfig.TokenSource(ctx)}))
+}
+
+// tokenURL picks the token endpoint the client-credentials grant posts to. It is
+// derived from the deployment; a config file that spells one out explicitly still
+// wins, because a self-hosted deployment can serve the authorization server from
+// somewhere other than the API host.
+func tokenURL(derived, override string) (string, error) {
+	if override == "" {
+		return derived, nil
+	}
+	return override, nil
 }
 
 func dial(target qualityoauth.Target, authOpt grpc.DialOption) (*grpc.ClientConn, error) {
