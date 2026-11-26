@@ -164,6 +164,7 @@ everywhere.
 
 ## Key Implementation Details
 
+- Every `UpsertEntity` and `UpsertType` call sends `qualityClients.writer`, built by `writerActor`: the tool and the GCP project as the name, `VIA_API`, and no user. If a call sends no actor, the server takes the writer from the token, and a client credential shows as its client id. Make each new upsert a method on `*qualityClients` that sends the writer; a nil receiver is the dry run. `writer_test.go` covers it.
 - Subscriptions use composite identifiers: `pubsub::<topic_id>::<subscription_id>`
 - Entity groups enable automatic cleanup via API's automatic deletion of entities not in new group
 - Relationships are only withdrawn for topic-to-subscription edges this run is configured to manage (see above)

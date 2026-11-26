@@ -15,6 +15,7 @@ import (
 	entitiescustomv1grpc "buf.build/gen/go/getsynq/api/grpc/go/synq/entities/custom/v1/customv1grpc"
 	entitiescustomv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/custom/v1"
 	entitiesv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/entities/v1"
+	actorv1 "buf.build/gen/go/getsynq/api/protocolbuffers/go/synq/issues/actor/v1"
 	"cloud.google.com/go/pubsub" //nolint:staticcheck // TODO: Migrate to pubsub/v2 - requires API changes
 	"github.com/getsynq/synq-google-cloud-pubsub/config"
 	"github.com/joho/godotenv"
@@ -153,7 +154,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}()
 
 		// Setup entity types in Coalesce Quality
-		mustSetupEntityTypes(ctx, cfg, qualityClients.types)
+		mustSetupEntityTypes(ctx, cfg, qualityClients)
 	}
 
 	// Sync Pub/Sub resources to Coalesce Quality
@@ -179,6 +180,23 @@ type qualityClients struct {
 	entities      entitiescustomv1grpc.EntitiesServiceClient
 	relationships entitiescustomv1grpc.RelationshipsServiceClient
 	groups        entitiescustomv1grpc.GroupsServiceClient
+	// writer is sent on every entity and type upsert. The workspace shows it as
+	// the writer of each topic and subscription, and the app warns before a
+	// person edits an entity that this sync overwrites on its next run.
+	writer *actorv1.Actor
+}
+
+// writerActor names this tool and the GCP project it syncs as the writer of
+// the entities and types. Without it, the server takes the writer from the
+// token, and a client credential shows as its client id.
+//
+// The user is empty, as no person runs the writes: the login is only the
+// credential. VIA_API marks the writer as a script.
+func writerActor(projectID string) *actorv1.Actor {
+	return &actorv1.Actor{
+		Name: fmt.Sprintf("%s (%s)", toolName, projectID),
+		Via:  actorv1.Actor_VIA_API,
+	}
 }
 
 func (c *qualityClients) close() error {
@@ -296,6 +314,7 @@ func mustCreateQualityClients(ctx context.Context, cfg *config.Config) *qualityC
 		entities:      entitiescustomv1grpc.NewEntitiesServiceClient(conn),
 		relationships: entitiescustomv1grpc.NewRelationshipsServiceClient(conn),
 		groups:        entitiescustomv1grpc.NewGroupsServiceClient(conn),
+		writer:        writerActor(cfg.GCP.ProjectID),
 	}
 }
 
@@ -304,7 +323,7 @@ func mustCreateQualityClients(ctx context.Context, cfg *config.Config) *qualityC
 // ============================================================================
 
 // mustSetupEntityTypes creates or updates the custom entity types
-func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient entitiescustomv1grpc.TypesServiceClient) {
+func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, clients *qualityClients) {
 	logger := slog.Default()
 
 	// Load icons
@@ -323,17 +342,18 @@ func mustSetupEntityTypes(ctx context.Context, cfg *config.Config, typesClient e
 		slog.Int("subscription_type_id", int(cfg.Types.SubscriptionTypeID)),
 	)
 
-	mustUpsertType(ctx, typesClient, cfg.Types.TopicTypeID, "Topic", topicIcon)
-	mustUpsertType(ctx, typesClient, cfg.Types.SubscriptionTypeID, "Subscription", subscriptionIcon)
+	clients.mustUpsertType(ctx, cfg.Types.TopicTypeID, "Topic", topicIcon)
+	clients.mustUpsertType(ctx, cfg.Types.SubscriptionTypeID, "Subscription", subscriptionIcon)
 
 	logger.InfoContext(ctx, "Entity types created successfully")
 }
 
 // mustUpsertType creates or updates a single entity type
-func mustUpsertType(ctx context.Context, client entitiescustomv1grpc.TypesServiceClient, typeID int32, name string, icon []byte) {
+func (c *qualityClients) mustUpsertType(ctx context.Context, typeID int32, name string, icon []byte) {
 	logger := slog.Default()
 
-	_, err := client.UpsertType(ctx, &entitiescustomv1.UpsertTypeRequest{
+	_, err := c.types.UpsertType(ctx, &entitiescustomv1.UpsertTypeRequest{
+		Actor: c.writer,
 		Type: &entitiesv1.Type{
 			TypeId:  typeID,
 			Name:    name,
@@ -425,7 +445,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 	}
 
 	// Sync topics and subscriptions
-	createdEntities, acceptedTopics, topicCount := syncTopics(ctx, cfg, pubsubClient, entitiesClient, filters.topics)
+	createdEntities, acceptedTopics, topicCount := syncTopics(ctx, cfg, pubsubClient, clients, filters.topics)
 
 	// List existing custom entities for relationship validation (only if relationships are enabled)
 	var customEntities map[string]bool
@@ -442,7 +462,7 @@ func syncResources(ctx context.Context, cfg *config.Config, pubsubClient *pubsub
 		ctx,
 		cfg,
 		pubsubClient,
-		entitiesClient,
+		clients,
 		filters,
 		acceptedTopics,
 		&createdEntities,
@@ -478,7 +498,7 @@ func syncTopics(
 	ctx context.Context,
 	cfg *config.Config,
 	pubsubClient *pubsub.Client,
-	entitiesClient entitiescustomv1grpc.EntitiesServiceClient,
+	clients *qualityClients,
 	topicFilter Filter,
 ) ([]*entitiesv1.Identifier, map[string]bool, int) {
 	logger := slog.Default()
@@ -523,7 +543,7 @@ func syncTopics(
 		createdEntities = append(createdEntities, topicID)
 		acceptedTopicIds[topic.ID()] = true
 
-		mustUpsertEntity(ctx, entitiesClient, topicID, cfg.Types.TopicTypeID, topic.ID())
+		clients.mustUpsertEntity(ctx, topicID, cfg.Types.TopicTypeID, topic.ID())
 	}
 
 	logger.InfoContext(ctx, "Topics processed", slog.Int("count", topicCount))
@@ -535,7 +555,7 @@ func syncSubscriptions(
 	ctx context.Context,
 	cfg *config.Config,
 	pubsubClient *pubsub.Client,
-	entitiesClient entitiescustomv1grpc.EntitiesServiceClient,
+	clients *qualityClients,
 	filters *filters,
 	acceptedTopicIds map[string]bool,
 	createdEntities *[]*entitiesv1.Identifier,
@@ -599,7 +619,7 @@ func syncSubscriptions(
 		}
 
 		*createdEntities = append(*createdEntities, subscriptionID)
-		mustUpsertEntity(ctx, entitiesClient, subscriptionID, cfg.Types.SubscriptionTypeID, truncate(subscription.ID(), 100))
+		clients.mustUpsertEntity(ctx, subscriptionID, cfg.Types.SubscriptionTypeID, truncate(subscription.ID(), 100))
 
 		// Create relationship if enabled and passes filter
 		if cfg.Relationships.Enabled {
@@ -687,12 +707,12 @@ func syncSubscriptions(
 	return subscriptionCount, relationshipsToCreate
 }
 
-// mustUpsertEntity creates or updates an entity
-func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesServiceClient, id *entitiesv1.Identifier, typeID int32, name string) {
+// mustUpsertEntity creates or updates an entity. A nil receiver is a dry run.
+func (c *qualityClients) mustUpsertEntity(ctx context.Context, id *entitiesv1.Identifier, typeID int32, name string) {
 	logger := slog.Default()
 
 	// Skip the API call in dry-run mode
-	if client == nil {
+	if c == nil {
 		logger.DebugContext(ctx, "[DRY-RUN] Would upsert entity",
 			slog.String("name", name),
 			slog.Int("type_id", int(typeID)),
@@ -701,7 +721,8 @@ func mustUpsertEntity(ctx context.Context, client entitiescustomv1grpc.EntitiesS
 		return
 	}
 
-	_, err := client.UpsertEntity(ctx, &entitiescustomv1.UpsertEntityRequest{
+	_, err := c.entities.UpsertEntity(ctx, &entitiescustomv1.UpsertEntityRequest{
+		Actor: c.writer,
 		Entity: &entitiesv1.Entity{
 			Id:        id,
 			TypeId:    typeID,
