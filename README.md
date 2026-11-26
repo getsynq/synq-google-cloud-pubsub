@@ -403,6 +403,8 @@ The integration consists of three main components:
 
 **Entity Groups:** The integration uses entity groups to track all entities created in each run. When the group is updated, Coalesce Quality automatically removes entities that were in the previous group but not in the current one, enabling automatic cleanup of deleted resources.
 
+**Writer:** Every type and entity write names `synq-google-cloud-pubsub (<project_id>)` as the writer, with no user. The app shows this name as "Last written by", and warns a person who edits a topic or subscription that the next run overwrites the change. Relationship and group writes take no writer.
+
 **Relationship Management:** When enabled, the integration creates relationships between topics and their subscriptions, and withdraws the ones that no longer exist.
 
 **Relationships are off by default on purpose.** Linking a topic to its
